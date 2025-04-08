@@ -38,7 +38,7 @@ const docTemplate = `{
         },
         "/api/query": {
             "post": {
-                "description": "Execute a SQL query against the data_matrix table with optional filtering and pagination",
+                "description": "Execute a SQL query against the data_matrix table with optional filtering and pagination\nTo select all columns (equivalent to SELECT * FROM data_matrix), you can either:\n1) Omit the columns field entirely\n2) Set columns to an empty array\n3) Explicitly use [\"*\"] as the columns value\nAll three approaches will return all columns for the matching rows.\nColumn names are case-insensitive, so you can use \"revenue\", \"REVENUE\", or \"Revenue\" interchangeably.",
                 "consumes": [
                     "application/json"
                 ],
@@ -88,7 +88,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "columns": {
-                    "description": "Optional, defaults to [\"*\"]",
+                    "description": "Optional list of columns to return. If empty or omitted, all columns will be returned (equivalent to SELECT *)\nTo select all columns, you can either: 1) omit this field, 2) provide an empty array, or 3) use [\"*\"]\nColumn names are case-insensitive, so you can use \"revenue\", \"REVENUE\", or \"Revenue\" interchangeably",
                     "type": "array",
                     "items": {
                         "type": "string"
@@ -100,7 +100,7 @@ const docTemplate = `{
                     ]
                 },
                 "limit": {
-                    "description": "Optional limit for results",
+                    "description": "Optional limit for the number of results to return",
                     "type": "integer",
                     "example": 10
                 },
@@ -110,7 +110,7 @@ const docTemplate = `{
                     "example": 0
                 },
                 "where": {
-                    "description": "Optional SQL WHERE clause",
+                    "description": "Optional SQL WHERE clause to filter results (e.g., \"Revenue \u003e 200 AND Industry = 'Technology'\")",
                     "type": "string",
                     "example": "Revenue \u003e 200"
                 }

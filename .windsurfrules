@@ -7,3 +7,4 @@ Keep the master rows in memory.
 Do not use sqlite.
 Data will be kept in memory.
 Use duckdb to allow sql queries of the data.
+Always kill the server using the command "lsof -i :8080 | grep LISTEN" and then pipe the process id to kill so this works in one command line step.
