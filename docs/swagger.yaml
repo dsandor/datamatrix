@@ -1,0 +1,95 @@
+basePath: /
+definitions:
+  main.QueryRequest:
+    properties:
+      columns:
+        description: Optional, defaults to ["*"]
+        example:
+        - '["ID_BB_GLOBAL"'
+        - '"Company"'
+        - '"Revenue"]'
+        items:
+          type: string
+        type: array
+      limit:
+        description: Optional limit for results
+        example: 10
+        type: integer
+      offset:
+        description: Optional offset for pagination
+        example: 0
+        type: integer
+      where:
+        description: Optional SQL WHERE clause
+        example: Revenue > 200
+        type: string
+    type: object
+  main.QueryResponse:
+    properties:
+      count:
+        description: Number of results returned
+        type: integer
+      data:
+        description: The query results
+        items:
+          additionalProperties: true
+          type: object
+        type: array
+      total:
+        description: Total number of records in the database
+        type: integer
+    type: object
+host: localhost:8080
+info:
+  contact: {}
+  description: A Go service that loads CSV files into an in-memory DuckDB database
+    and provides an HTTP API for querying the data using SQL.
+  title: DataMatrix API
+  version: "1.0"
+paths:
+  /api/columns:
+    get:
+      description: Returns the list of all columns available in the data_matrix table
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get all available columns
+      tags:
+      - columns
+  /api/query:
+    post:
+      consumes:
+      - application/json
+      description: Execute a SQL query against the data_matrix table with optional
+        filtering and pagination
+      parameters:
+      - description: Query parameters
+        in: body
+        name: query
+        required: true
+        schema:
+          $ref: '#/definitions/main.QueryRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/main.QueryResponse'
+        "400":
+          description: Invalid request body
+          schema:
+            type: string
+        "500":
+          description: Query error
+          schema:
+            type: string
+      summary: Query the data_matrix table
+      tags:
+      - query
+swagger: "2.0"

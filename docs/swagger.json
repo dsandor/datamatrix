@@ -1,0 +1,135 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "A Go service that loads CSV files into an in-memory DuckDB database and provides an HTTP API for querying the data using SQL.",
+        "title": "DataMatrix API",
+        "contact": {},
+        "version": "1.0"
+    },
+    "host": "localhost:8080",
+    "basePath": "/",
+    "paths": {
+        "/api/columns": {
+            "get": {
+                "description": "Returns the list of all columns available in the data_matrix table",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "columns"
+                ],
+                "summary": "Get all available columns",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/api/query": {
+            "post": {
+                "description": "Execute a SQL query against the data_matrix table with optional filtering and pagination",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "query"
+                ],
+                "summary": "Query the data_matrix table",
+                "parameters": [
+                    {
+                        "description": "Query parameters",
+                        "name": "query",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/main.QueryRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/main.QueryResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid request body",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Query error",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "main.QueryRequest": {
+            "type": "object",
+            "properties": {
+                "columns": {
+                    "description": "Optional, defaults to [\"*\"]",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "[\"ID_BB_GLOBAL\"",
+                        "\"Company\"",
+                        "\"Revenue\"]"
+                    ]
+                },
+                "limit": {
+                    "description": "Optional limit for results",
+                    "type": "integer",
+                    "example": 10
+                },
+                "offset": {
+                    "description": "Optional offset for pagination",
+                    "type": "integer",
+                    "example": 0
+                },
+                "where": {
+                    "description": "Optional SQL WHERE clause",
+                    "type": "string",
+                    "example": "Revenue \u003e 200"
+                }
+            }
+        },
+        "main.QueryResponse": {
+            "type": "object",
+            "properties": {
+                "count": {
+                    "description": "Number of results returned",
+                    "type": "integer"
+                },
+                "data": {
+                    "description": "The query results",
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                    }
+                },
+                "total": {
+                    "description": "Total number of records in the database",
+                    "type": "integer"
+                }
+            }
+        }
+    }
+}
