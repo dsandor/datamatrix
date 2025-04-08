@@ -22,9 +22,19 @@ type DataMatrix struct {
 	db      *sql.DB
 	columns []string
 	logger  *Logger
+	s3Bucket string // S3 bucket name (optional)
+	s3Prefix string // S3 prefix/path within the bucket (optional)
+	dataDir  string // Local directory for downloaded S3 files
 }
 
-func NewDataMatrix() (*DataMatrix, error) {
+// DataMatrixConfig holds configuration for DataMatrix initialization
+type DataMatrixConfig struct {
+	S3Bucket string // Optional S3 bucket name
+	S3Prefix string // Optional S3 prefix/path within the bucket
+	DataDir  string // Directory for downloaded S3 files (default: "data")
+}
+
+func NewDataMatrix(config *DataMatrixConfig) (*DataMatrix, error) {
 	// Create a logger
 	logger := NewLogger()
 	logger.Info("Initializing DataMatrix...")
@@ -39,9 +49,18 @@ func NewDataMatrix() (*DataMatrix, error) {
 		return nil, fmt.Errorf("error opening DuckDB: %v", err)
 	}
 
+	// Set default data directory if not specified
+	dataDir := "data"
+	if config != nil && config.DataDir != "" {
+		dataDir = config.DataDir
+	}
+
 	dm := &DataMatrix{
-		db:     db,
-		logger: logger,
+		db:       db,
+		logger:   logger,
+		s3Bucket: config.S3Bucket,
+		s3Prefix: config.S3Prefix,
+		dataDir:  dataDir,
 	}
 
 	if err := dm.loadData(); err != nil {
@@ -91,15 +110,44 @@ func findCSVFiles(baseDir string, currentDepth, maxDepth int, logger *Logger) ([
 }
 
 func (dm *DataMatrix) loadData() error {
-	// Find all CSV files up to 2 levels deep
-	dm.logger.Info("Searching for CSV files in example-data directory and subdirectories (up to 2 levels deep)...")
-	csvFiles, err := findCSVFiles("example-data", 0, 2, dm.logger)
-	if err != nil {
-		dm.logger.Error("Error finding CSV files: %v", err)
-		return fmt.Errorf("error finding CSV files: %v", err)
-	}
+	var csvFiles []string
+	var err error
 
-	dm.logger.Success("Found %d CSV files in example-data directory and subdirectories (up to 2 levels deep)", len(csvFiles))
+	// Check if we should load from S3
+	if dm.s3Bucket != "" {
+		if dm.s3Prefix != "" {
+			dm.logger.Info("Loading data from S3 bucket: %s with prefix: %s", dm.s3Bucket, dm.s3Prefix)
+		} else {
+			dm.logger.Info("Loading data from S3 bucket: %s", dm.s3Bucket)
+		}
+		
+		// Try to load from S3
+		s3Files, s3Err := CopyS3FilesToLocal(dm.logger, dm.s3Bucket, dm.s3Prefix, dm.dataDir)
+		if s3Err == nil {
+			// S3 loading succeeded
+			csvFiles = s3Files
+			
+			if dm.s3Prefix != "" {
+				dm.logger.Success("Successfully loaded %d files from S3 bucket %s with prefix %s", len(csvFiles), dm.s3Bucket, dm.s3Prefix)
+			} else {
+				dm.logger.Success("Successfully loaded %d files from S3 bucket %s", len(csvFiles), dm.s3Bucket)
+			}
+		} else {
+			// S3 loading failed, fall back to local data
+			dm.logger.Warn("Error loading data from S3: %v", s3Err)
+			dm.logger.Warn("Falling back to local data loading...")
+		}
+	} else {
+		// Load from local filesystem
+		dm.logger.Info("Searching for CSV files in example-data directory and subdirectories (up to 2 levels deep)...")
+		csvFiles, err = findCSVFiles("example-data", 0, 2, dm.logger)
+		if err != nil {
+			dm.logger.Error("Error finding CSV files: %v", err)
+			return fmt.Errorf("error finding CSV files: %v", err)
+		}
+
+		dm.logger.Success("Found %d CSV files in example-data directory and subdirectories (up to 2 levels deep)", len(csvFiles))
+	}
 
 	// Create temporary views for each CSV file and collect column information
 	dm.logger.Info("Creating temporary views for CSV files...")
@@ -119,8 +167,10 @@ func (dm *DataMatrix) loadData() error {
 				"\\", "_"),
 			".", "_")
 		
-		// Create a temporary view for the CSV
+		// Create a temporary view for the CSV (handles both regular and gzipped CSVs)
 		dm.logger.Debug("Creating view for %s as %s", filePath, viewName)
+		
+		// DuckDB can automatically detect and handle gzipped files
 		_, err = dm.db.Exec(fmt.Sprintf("CREATE VIEW %s AS SELECT * FROM read_csv_auto('%s')", viewName, filePath))
 		if err != nil {
 			dm.logger.Error("Error creating view for %s: %v", filePath, err)
@@ -416,7 +466,31 @@ func main() {
 		}
 	}
 
-	dm, err := NewDataMatrix()
+	// Create the DataMatrix configuration
+	config := &DataMatrixConfig{}
+	
+	// Check if S3 bucket is specified as an environment variable
+	s3Path := os.Getenv("S3_BUCKET")
+	if s3Path != "" {
+		// Remove the s3:// prefix if present
+		s3Path = strings.TrimPrefix(s3Path, "s3://")
+		
+		// Split the path into bucket and prefix
+		parts := strings.SplitN(s3Path, "/", 2)
+		bucketName := parts[0]
+		prefix := ""
+		if len(parts) > 1 {
+			prefix = parts[1]
+		}
+		
+		logger.Info("S3 bucket specified: %s, prefix: %s", bucketName, prefix)
+		config.S3Bucket = bucketName
+		config.S3Prefix = prefix
+		config.DataDir = "data" // Default data directory for S3 downloads
+	}
+	
+	// Create the DataMatrix
+	dm, err := NewDataMatrix(config)
 	if err != nil {
 		logger.Error("Error initializing DataMatrix: %v", err)
 		os.Exit(1)
