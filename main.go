@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,35 +21,51 @@ type DataMatrix struct {
 	sync.RWMutex
 	db      *sql.DB
 	columns []string
+	logger  *Logger
 }
 
 func NewDataMatrix() (*DataMatrix, error) {
+	// Create a logger
+	logger := NewLogger()
+	logger.Info("Initializing DataMatrix...")
+
+	// Log initial memory usage
+	logger.Memory("Initial memory usage: %s", GetMemoryUsageSummary())
+
 	// Open an in-memory DuckDB database
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
+		logger.Error("Error opening DuckDB: %v", err)
 		return nil, fmt.Errorf("error opening DuckDB: %v", err)
 	}
 
 	dm := &DataMatrix{
-		db: db,
+		db:     db,
+		logger: logger,
 	}
 
 	if err := dm.loadData(); err != nil {
+		logger.Error("Error loading data: %v", err)
 		db.Close()
 		return nil, err
 	}
+
+	// Log memory usage after loading data
+	logger.Memory("Memory usage after loading data: %s", GetMemoryUsageSummary())
+	logger.Success("DataMatrix initialized successfully")
 
 	return dm, nil
 }
 
 // findCSVFiles recursively finds CSV files up to maxDepth levels deep
-func findCSVFiles(baseDir string, currentDepth, maxDepth int) ([]string, error) {
+func findCSVFiles(baseDir string, currentDepth, maxDepth int, logger *Logger) ([]string, error) {
 	if currentDepth > maxDepth {
 		return nil, nil
 	}
 
 	files, err := os.ReadDir(baseDir)
 	if err != nil {
+		logger.Error("Error reading directory %s: %v", baseDir, err)
 		return nil, fmt.Errorf("error reading directory %s: %v", baseDir, err)
 	}
 
@@ -58,14 +73,16 @@ func findCSVFiles(baseDir string, currentDepth, maxDepth int) ([]string, error) 
 	for _, file := range files {
 		path := filepath.Join(baseDir, file.Name())
 		if file.IsDir() {
+			logger.Debug("Searching subdirectory: %s (depth: %d/%d)", path, currentDepth+1, maxDepth)
 			// Recursively search subdirectories up to maxDepth
-			subFiles, err := findCSVFiles(path, currentDepth+1, maxDepth)
+			subFiles, err := findCSVFiles(path, currentDepth+1, maxDepth, logger)
 			if err != nil {
-				log.Printf("Warning: %v", err)
+				logger.Warn("Warning: %v", err)
 				continue
 			}
 			csvFiles = append(csvFiles, subFiles...)
 		} else if strings.HasSuffix(strings.ToLower(file.Name()), ".csv") {
+			logger.Debug("Found CSV file: %s", path)
 			csvFiles = append(csvFiles, path)
 		}
 	}
@@ -75,20 +92,23 @@ func findCSVFiles(baseDir string, currentDepth, maxDepth int) ([]string, error) 
 
 func (dm *DataMatrix) loadData() error {
 	// Find all CSV files up to 2 levels deep
-	csvFiles, err := findCSVFiles("example-data", 0, 2)
+	dm.logger.Info("Searching for CSV files in example-data directory and subdirectories (up to 2 levels deep)...")
+	csvFiles, err := findCSVFiles("example-data", 0, 2, dm.logger)
 	if err != nil {
+		dm.logger.Error("Error finding CSV files: %v", err)
 		return fmt.Errorf("error finding CSV files: %v", err)
 	}
 
-	log.Printf("Found %d CSV files in example-data directory and subdirectories (up to 2 levels deep)", len(csvFiles))
+	dm.logger.Success("Found %d CSV files in example-data directory and subdirectories (up to 2 levels deep)", len(csvFiles))
 
 	// Create temporary views for each CSV file and collect column information
+	dm.logger.Info("Creating temporary views for CSV files...")
 	validFiles := make([]string, 0)
 	for _, filePath := range csvFiles {
 		// Create a unique view name based on the file path
 		relPath, err := filepath.Rel("example-data", filePath)
 		if err != nil {
-			log.Printf("Error getting relative path for %s: %v", filePath, err)
+			dm.logger.Error("Error getting relative path for %s: %v", filePath, err)
 			continue
 		}
 		
@@ -100,9 +120,10 @@ func (dm *DataMatrix) loadData() error {
 			".", "_")
 		
 		// Create a temporary view for the CSV
+		dm.logger.Debug("Creating view for %s as %s", filePath, viewName)
 		_, err = dm.db.Exec(fmt.Sprintf("CREATE VIEW %s AS SELECT * FROM read_csv_auto('%s')", viewName, filePath))
 		if err != nil {
-			log.Printf("Error creating view for %s: %v", filePath, err)
+			dm.logger.Error("Error creating view for %s: %v", filePath, err)
 			continue
 		}
 
@@ -111,19 +132,19 @@ func (dm *DataMatrix) loadData() error {
 		row := dm.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) > 0 FROM pragma_table_info('%s') WHERE name = 'ID_BB_GLOBAL'", viewName))
 		err = row.Scan(&hasIDColumn)
 		if err != nil {
-			log.Printf("Error checking for ID_BB_GLOBAL in %s: %v", filePath, err)
+			dm.logger.Error("Error checking for ID_BB_GLOBAL in %s: %v", filePath, err)
 			dm.db.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", viewName))
 			continue
 		}
 
 		if !hasIDColumn {
-			log.Printf("Skipping file %s: No ID_BB_GLOBAL column found", filePath)
+			dm.logger.Warn("Skipping file %s: No ID_BB_GLOBAL column found", filePath)
 			dm.db.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", viewName))
 			continue
 		}
 
 		validFiles = append(validFiles, viewName)
-		log.Printf("Added valid CSV file: %s", filePath)
+		dm.logger.Success("Added valid CSV file: %s", filePath)
 	}
 
 	if len(validFiles) == 0 {
@@ -147,7 +168,7 @@ func (dm *DataMatrix) loadData() error {
 	for _, view := range validFiles {
 		rows, err := dm.db.Query(fmt.Sprintf("SELECT name FROM pragma_table_info('%s') WHERE name != 'ID_BB_GLOBAL'", view))
 		if err != nil {
-			log.Printf("Error getting columns for %s: %v", view, err)
+			dm.logger.Error("Error getting columns for %s: %v", view, err)
 			continue
 		}
 
@@ -155,7 +176,7 @@ func (dm *DataMatrix) loadData() error {
 			var colName string
 			if err := rows.Scan(&colName); err != nil {
 				rows.Close()
-				log.Printf("Error scanning column name: %v", err)
+				dm.logger.Error("Error scanning column name: %v", err)
 				continue
 			}
 			if !columnMap[colName] {
@@ -206,12 +227,19 @@ func (dm *DataMatrix) loadData() error {
 		return fmt.Errorf("error counting rows: %v", err)
 	}
 
-	log.Printf("Loaded data_matrix table with %d rows and %d columns", rowCount, len(dm.columns))
+	dm.logger.Success("Loaded data_matrix table with %d rows and %d columns", rowCount, len(dm.columns))
 	return nil
 }
 
 func (dm *DataMatrix) Close() error {
-	return dm.db.Close()
+	dm.logger.Info("Closing database connection...")
+	err := dm.db.Close()
+	if err != nil {
+		dm.logger.Error("Error closing database: %v", err)
+	} else {
+		dm.logger.Success("Database closed successfully")
+	}
+	return err
 }
 
 // @Summary Get all available columns
@@ -359,7 +387,7 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 	row := dm.db.QueryRow("SELECT COUNT(*) FROM data_matrix")
 	err = row.Scan(&total)
 	if err != nil {
-		log.Printf("Error getting total count: %v", err)
+		dm.logger.Error("Error getting total count: %v", err)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -376,17 +404,22 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 // @host localhost:8080
 // @BasePath /
 func main() {
+	// Create a logger for the main function
+	logger := NewLogger()
+	
 	// Check if example-data directory exists, if not create test data
 	if _, err := os.Stat("example-data"); os.IsNotExist(err) {
-		log.Println("Creating test data...")
+		logger.Info("Creating test data...")
 		if err := createTestData(); err != nil {
-			log.Fatalf("Error creating test data: %v", err)
+			logger.Error("Error creating test data: %v", err)
+			os.Exit(1)
 		}
 	}
 
 	dm, err := NewDataMatrix()
 	if err != nil {
-		log.Fatalf("Error initializing DataMatrix: %v", err)
+		logger.Error("Error initializing DataMatrix: %v", err)
+		os.Exit(1)
 	}
 	defer dm.Close()
 
@@ -403,9 +436,14 @@ func main() {
 	})
 
 	port := "8080"
-	log.Printf("Starting server on port %s", port)
-	log.Printf("Swagger UI available at http://localhost:%s/swagger/index.html", port)
+	logger.Info("Starting server on port %s", port)
+	logger.Info("Swagger UI available at http://localhost:%s/swagger/index.html", port)
+	
+	// Log memory usage before starting server
+	logger.Memory("Memory usage before starting server: %s", GetMemoryUsageSummary())
+	
 	if err := http.ListenAndServe(":"+port, r); err != nil {
-		log.Fatalf("Error starting server: %v", err)
+		logger.Error("Error starting server: %v", err)
+		os.Exit(1)
 	}
 }

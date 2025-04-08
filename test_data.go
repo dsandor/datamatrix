@@ -2,24 +2,31 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 )
 
 // createTestData creates test CSV files for development and testing
 func createTestData() error {
+	// Create a logger
+	logger := NewLogger()
+	
 	// Create example-data directory if it doesn't exist
+	logger.Info("Creating example-data directory...")
 	if err := os.MkdirAll("example-data", 0755); err != nil {
+		logger.Error("Error creating directory: %v", err)
 		return fmt.Errorf("error creating directory: %v", err)
 	}
 
 	// Create subdirectories for testing recursive loading
+	logger.Info("Creating subdirectories for testing recursive loading...")
 	if err := os.MkdirAll(filepath.Join("example-data", "financial"), 0755); err != nil {
+		logger.Error("Error creating subdirectory: %v", err)
 		return fmt.Errorf("error creating subdirectory: %v", err)
 	}
 
 	if err := os.MkdirAll(filepath.Join("example-data", "technology", "us"), 0755); err != nil {
+		logger.Error("Error creating nested subdirectory: %v", err)
 		return fmt.Errorf("error creating nested subdirectory: %v", err)
 	}
 
@@ -70,6 +77,6 @@ Test3,300,2023-01-03
 		return fmt.Errorf("error writing file: %v", err)
 	}
 
-	log.Println("Test data created successfully with files in root directory and subdirectories (up to 2 levels deep)")
+	logger.Success("Test data created successfully with files in root directory and subdirectories (up to 2 levels deep)")
 	return nil
 }
