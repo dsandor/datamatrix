@@ -3,7 +3,10 @@ definitions:
   main.QueryRequest:
     properties:
       columns:
-        description: Optional, defaults to ["*"]
+        description: |-
+          Optional list of columns to return. If empty or omitted, all columns will be returned (equivalent to SELECT *)
+          To select all columns, you can either: 1) omit this field, 2) provide an empty array, or 3) use ["*"]
+          Column names are case-insensitive, so you can use "revenue", "REVENUE", or "Revenue" interchangeably
         example:
         - '["ID_BB_GLOBAL"'
         - '"Company"'
@@ -12,7 +15,7 @@ definitions:
           type: string
         type: array
       limit:
-        description: Optional limit for results
+        description: Optional limit for the number of results to return
         example: 10
         type: integer
       offset:
@@ -20,7 +23,8 @@ definitions:
         example: 0
         type: integer
       where:
-        description: Optional SQL WHERE clause
+        description: Optional SQL WHERE clause to filter results (e.g., "Revenue >
+          200 AND Industry = 'Technology'")
         example: Revenue > 200
         type: string
     type: object
@@ -65,8 +69,14 @@ paths:
     post:
       consumes:
       - application/json
-      description: Execute a SQL query against the data_matrix table with optional
-        filtering and pagination
+      description: |-
+        Execute a SQL query against the data_matrix table with optional filtering and pagination
+        To select all columns (equivalent to SELECT * FROM data_matrix), you can either:
+        1) Omit the columns field entirely
+        2) Set columns to an empty array
+        3) Explicitly use ["*"] as the columns value
+        All three approaches will return all columns for the matching rows.
+        Column names are case-insensitive, so you can use "revenue", "REVENUE", or "Revenue" interchangeably.
       parameters:
       - description: Query parameters
         in: body

@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,66 +21,130 @@ type DataMatrix struct {
 	sync.RWMutex
 	db      *sql.DB
 	columns []string
+	logger  *Logger
 }
 
 func NewDataMatrix() (*DataMatrix, error) {
+	// Create a logger
+	logger := NewLogger()
+	logger.Info("Initializing DataMatrix...")
+
+	// Log initial memory usage
+	logger.Memory("Initial memory usage: %s", GetMemoryUsageSummary())
+
 	// Open an in-memory DuckDB database
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
+		logger.Error("Error opening DuckDB: %v", err)
 		return nil, fmt.Errorf("error opening DuckDB: %v", err)
 	}
 
 	dm := &DataMatrix{
-		db: db,
+		db:     db,
+		logger: logger,
 	}
 
 	if err := dm.loadData(); err != nil {
+		logger.Error("Error loading data: %v", err)
 		db.Close()
 		return nil, err
 	}
 
+	// Log memory usage after loading data
+	logger.Memory("Memory usage after loading data: %s", GetMemoryUsageSummary())
+	logger.Success("DataMatrix initialized successfully")
+
 	return dm, nil
 }
 
-func (dm *DataMatrix) loadData() error {
-	// Get list of CSV files
-	files, err := os.ReadDir("example-data")
-	if err != nil {
-		return fmt.Errorf("error reading directory: %v", err)
+// findCSVFiles recursively finds CSV files up to maxDepth levels deep
+func findCSVFiles(baseDir string, currentDepth, maxDepth int, logger *Logger) ([]string, error) {
+	if currentDepth > maxDepth {
+		return nil, nil
 	}
 
-	// Create temporary views for each CSV file and collect column information
-	validFiles := make([]string, 0)
+	files, err := os.ReadDir(baseDir)
+	if err != nil {
+		logger.Error("Error reading directory %s: %v", baseDir, err)
+		return nil, fmt.Errorf("error reading directory %s: %v", baseDir, err)
+	}
+
+	var csvFiles []string
 	for _, file := range files {
-		if !file.IsDir() && strings.HasSuffix(strings.ToLower(file.Name()), ".csv") {
-			filePath := filepath.Join("example-data", file.Name())
-			
-			// Create a temporary view for the CSV
-			viewName := fmt.Sprintf("temp_%s", strings.ReplaceAll(filepath.Base(file.Name()), ".", "_"))
-			_, err := dm.db.Exec(fmt.Sprintf("CREATE VIEW %s AS SELECT * FROM read_csv_auto('%s')", viewName, filePath))
+		path := filepath.Join(baseDir, file.Name())
+		if file.IsDir() {
+			logger.Debug("Searching subdirectory: %s (depth: %d/%d)", path, currentDepth+1, maxDepth)
+			// Recursively search subdirectories up to maxDepth
+			subFiles, err := findCSVFiles(path, currentDepth+1, maxDepth, logger)
 			if err != nil {
-				log.Printf("Error creating view for %s: %v", file.Name(), err)
+				logger.Warn("Warning: %v", err)
 				continue
 			}
-
-			// Check if ID_BB_GLOBAL exists in this file
-			var hasIDColumn bool
-			row := dm.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) > 0 FROM pragma_table_info('%s') WHERE name = 'ID_BB_GLOBAL'", viewName))
-			err = row.Scan(&hasIDColumn)
-			if err != nil {
-				log.Printf("Error checking for ID_BB_GLOBAL in %s: %v", file.Name(), err)
-				dm.db.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", viewName))
-				continue
-			}
-
-			if !hasIDColumn {
-				log.Printf("Skipping file %s: No ID_BB_GLOBAL column found", file.Name())
-				dm.db.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", viewName))
-				continue
-			}
-
-			validFiles = append(validFiles, viewName)
+			csvFiles = append(csvFiles, subFiles...)
+		} else if strings.HasSuffix(strings.ToLower(file.Name()), ".csv") {
+			logger.Debug("Found CSV file: %s", path)
+			csvFiles = append(csvFiles, path)
 		}
+	}
+
+	return csvFiles, nil
+}
+
+func (dm *DataMatrix) loadData() error {
+	// Find all CSV files up to 2 levels deep
+	dm.logger.Info("Searching for CSV files in example-data directory and subdirectories (up to 2 levels deep)...")
+	csvFiles, err := findCSVFiles("example-data", 0, 2, dm.logger)
+	if err != nil {
+		dm.logger.Error("Error finding CSV files: %v", err)
+		return fmt.Errorf("error finding CSV files: %v", err)
+	}
+
+	dm.logger.Success("Found %d CSV files in example-data directory and subdirectories (up to 2 levels deep)", len(csvFiles))
+
+	// Create temporary views for each CSV file and collect column information
+	dm.logger.Info("Creating temporary views for CSV files...")
+	validFiles := make([]string, 0)
+	for _, filePath := range csvFiles {
+		// Create a unique view name based on the file path
+		relPath, err := filepath.Rel("example-data", filePath)
+		if err != nil {
+			dm.logger.Error("Error getting relative path for %s: %v", filePath, err)
+			continue
+		}
+		
+		// Create a safe view name by replacing non-alphanumeric characters
+		viewName := "temp_" + strings.ReplaceAll(
+			strings.ReplaceAll(
+				strings.ReplaceAll(relPath, "/", "_"),
+				"\\", "_"),
+			".", "_")
+		
+		// Create a temporary view for the CSV
+		dm.logger.Debug("Creating view for %s as %s", filePath, viewName)
+		_, err = dm.db.Exec(fmt.Sprintf("CREATE VIEW %s AS SELECT * FROM read_csv_auto('%s')", viewName, filePath))
+		if err != nil {
+			dm.logger.Error("Error creating view for %s: %v", filePath, err)
+			continue
+		}
+
+		// Check if ID_BB_GLOBAL exists in this file
+		var hasIDColumn bool
+		row := dm.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) > 0 FROM pragma_table_info('%s') WHERE name = 'ID_BB_GLOBAL'", viewName))
+		err = row.Scan(&hasIDColumn)
+		if err != nil {
+			dm.logger.Error("Error checking for ID_BB_GLOBAL in %s: %v", filePath, err)
+			dm.db.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", viewName))
+			continue
+		}
+
+		if !hasIDColumn {
+			dm.logger.Warn("Skipping file %s: No ID_BB_GLOBAL column found", filePath)
+			dm.db.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", viewName))
+			continue
+		}
+
+		validFiles = append(validFiles, viewName)
+		dm.logger.Success("Added valid CSV file: %s", filePath)
 	}
 
 	if len(validFiles) == 0 {
@@ -105,7 +168,7 @@ func (dm *DataMatrix) loadData() error {
 	for _, view := range validFiles {
 		rows, err := dm.db.Query(fmt.Sprintf("SELECT name FROM pragma_table_info('%s') WHERE name != 'ID_BB_GLOBAL'", view))
 		if err != nil {
-			log.Printf("Error getting columns for %s: %v", view, err)
+			dm.logger.Error("Error getting columns for %s: %v", view, err)
 			continue
 		}
 
@@ -113,7 +176,7 @@ func (dm *DataMatrix) loadData() error {
 			var colName string
 			if err := rows.Scan(&colName); err != nil {
 				rows.Close()
-				log.Printf("Error scanning column name: %v", err)
+				dm.logger.Error("Error scanning column name: %v", err)
 				continue
 			}
 			if !columnMap[colName] {
@@ -164,12 +227,19 @@ func (dm *DataMatrix) loadData() error {
 		return fmt.Errorf("error counting rows: %v", err)
 	}
 
-	log.Printf("Loaded data_matrix table with %d rows and %d columns", rowCount, len(dm.columns))
+	dm.logger.Success("Loaded data_matrix table with %d rows and %d columns", rowCount, len(dm.columns))
 	return nil
 }
 
 func (dm *DataMatrix) Close() error {
-	return dm.db.Close()
+	dm.logger.Info("Closing database connection...")
+	err := dm.db.Close()
+	if err != nil {
+		dm.logger.Error("Error closing database: %v", err)
+	} else {
+		dm.logger.Success("Database closed successfully")
+	}
+	return err
 }
 
 // @Summary Get all available columns
@@ -191,10 +261,19 @@ func (dm *DataMatrix) handleGetColumns(w http.ResponseWriter, r *http.Request) {
 
 // QueryRequest defines the structure for the query API request
 type QueryRequest struct {
-	Columns []string `json:"columns" example:"[\"ID_BB_GLOBAL\",\"Company\",\"Revenue\"]"` // Optional, defaults to ["*"]
-	Where   string   `json:"where,omitempty" example:"Revenue > 200"`                      // Optional SQL WHERE clause
-	Limit   int      `json:"limit,omitempty" example:"10"`                                // Optional limit for results
-	Offset  int      `json:"offset,omitempty" example:"0"`                                // Optional offset for pagination
+	// Optional list of columns to return. If empty or omitted, all columns will be returned (equivalent to SELECT *)
+	// To select all columns, you can either: 1) omit this field, 2) provide an empty array, or 3) use ["*"]
+	// Column names are case-insensitive, so you can use "revenue", "REVENUE", or "Revenue" interchangeably
+	Columns []string `json:"columns" example:"[\"ID_BB_GLOBAL\",\"Company\",\"Revenue\"]"` 
+
+	// Optional SQL WHERE clause to filter results (e.g., "Revenue > 200 AND Industry = 'Technology'")
+	Where   string   `json:"where,omitempty" example:"Revenue > 200"`
+
+	// Optional limit for the number of results to return
+	Limit   int      `json:"limit,omitempty" example:"10"`
+
+	// Optional offset for pagination
+	Offset  int      `json:"offset,omitempty" example:"0"`
 }
 
 // QueryResponse defines the structure for the query API response
@@ -206,6 +285,12 @@ type QueryResponse struct {
 
 // @Summary Query the data_matrix table
 // @Description Execute a SQL query against the data_matrix table with optional filtering and pagination
+// @Description To select all columns (equivalent to SELECT * FROM data_matrix), you can either:
+// @Description 1) Omit the columns field entirely
+// @Description 2) Set columns to an empty array
+// @Description 3) Explicitly use ["*"] as the columns value
+// @Description All three approaches will return all columns for the matching rows.
+// @Description Column names are case-insensitive, so you can use "revenue", "REVENUE", or "Revenue" interchangeably.
 // @Tags query
 // @Accept json
 // @Produce json
@@ -230,8 +315,26 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 		params.Columns = []string{"*"}
 	}
 
-	// Construct SQL query
-	query := fmt.Sprintf("SELECT %s FROM data_matrix", strings.Join(params.Columns, ", "))
+	// Construct SQL query with case-insensitive column handling
+	var columnList string
+	if len(params.Columns) == 1 && params.Columns[0] == "*" {
+		// If selecting all columns, just use *
+		columnList = "*"
+	} else {
+		// Otherwise, make each column name case-insensitive using ILIKE
+		columnParts := make([]string, len(params.Columns))
+		for i, col := range params.Columns {
+			// For each column, find the actual column name with correct case
+			columnParts[i] = fmt.Sprintf("CASE WHEN '%s' ILIKE 'id_bb_global' THEN ID_BB_GLOBAL ELSE "+
+				"(SELECT CASE WHEN COUNT(*) > 0 THEN MAX("+
+				"CASE WHEN LOWER(column_name) = LOWER('%s') THEN column_name END)"+
+				" ELSE '%s' END FROM pragma_table_info('data_matrix') WHERE LOWER(name) = LOWER('%s')) END", 
+				col, col, col, col)
+		}
+		columnList = strings.Join(columnParts, ", ")
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM data_matrix", columnList)
 	if params.Where != "" {
 		query += " WHERE " + params.Where
 	}
@@ -284,7 +387,7 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 	row := dm.db.QueryRow("SELECT COUNT(*) FROM data_matrix")
 	err = row.Scan(&total)
 	if err != nil {
-		log.Printf("Error getting total count: %v", err)
+		dm.logger.Error("Error getting total count: %v", err)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -301,17 +404,22 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 // @host localhost:8080
 // @BasePath /
 func main() {
+	// Create a logger for the main function
+	logger := NewLogger()
+	
 	// Check if example-data directory exists, if not create test data
 	if _, err := os.Stat("example-data"); os.IsNotExist(err) {
-		log.Println("Creating test data...")
+		logger.Info("Creating test data...")
 		if err := createTestData(); err != nil {
-			log.Fatalf("Error creating test data: %v", err)
+			logger.Error("Error creating test data: %v", err)
+			os.Exit(1)
 		}
 	}
 
 	dm, err := NewDataMatrix()
 	if err != nil {
-		log.Fatalf("Error initializing DataMatrix: %v", err)
+		logger.Error("Error initializing DataMatrix: %v", err)
+		os.Exit(1)
 	}
 	defer dm.Close()
 
@@ -328,9 +436,14 @@ func main() {
 	})
 
 	port := "8080"
-	log.Printf("Starting server on port %s", port)
-	log.Printf("Swagger UI available at http://localhost:%s/swagger/index.html", port)
+	logger.Info("Starting server on port %s", port)
+	logger.Info("Swagger UI available at http://localhost:%s/swagger/index.html", port)
+	
+	// Log memory usage before starting server
+	logger.Memory("Memory usage before starting server: %s", GetMemoryUsageSummary())
+	
 	if err := http.ListenAndServe(":"+port, r); err != nil {
-		log.Fatalf("Error starting server: %v", err)
+		logger.Error("Error starting server: %v", err)
+		os.Exit(1)
 	}
 }
