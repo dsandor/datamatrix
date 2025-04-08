@@ -12,16 +12,42 @@ go mod tidy
 ```
 
 ## Usage
+
+### Local Files
 1. Place your CSV files in the `example-data` directory (sample data will be created automatically if the directory doesn't exist)
 2. Start the server:
    ```bash
    go run main.go
    ```
 
+### Loading from S3
+You can also load data directly from an S3 bucket:
+
+1. Set the S3 bucket name as an environment variable:
+   ```bash
+   export S3_BUCKET="your-bucket-name"
+   ```
+
+2. Ensure AWS credentials are properly configured (via environment variables, credentials file, or IAM role)
+
+3. Start the server:
+   ```bash
+   go run main.go
+   ```
+
+When using S3 integration:
+- The application will traverse the bucket and find all CSV files (both plain and gzipped)
+- For each directory in the bucket, it will download only the most recent CSV file
+- Files are downloaded to a local `data` directory, preserving the original S3 directory structure
+- Gzipped CSV files (`.csv.gz` or `.gz`) are read directly without decompression
+- Only files with an `ID_BB_GLOBAL` column will be included in the final data matrix
+
 ## How It Works
 
 The application:
-1. Loads all CSV files from the `example-data` directory and its subdirectories (up to 2 levels deep)
+1. Loads data from one of two sources:
+   - Local CSV files from the `example-data` directory and its subdirectories (up to 2 levels deep)
+   - An S3 bucket (when `S3_BUCKET` environment variable is set), downloading only the most recent file from each directory
 2. Skips files without an `ID_BB_GLOBAL` column
 3. Creates a wide table with one row per unique `ID_BB_GLOBAL` value
 4. Keeps all data in an in-memory DuckDB database for fast SQL querying
