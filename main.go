@@ -14,10 +14,10 @@ import (
 	_ "datamatrix/docs" // Import generated docs
 )
 
-// DataMatrix manages the in-memory data dictionary
+// DataMatrix manages the JSON-based asset storage
 type DataMatrix struct {
 	sync.RWMutex
-	dataDictionary *DataDictionary
+	assetManager   *JSONAssetManager
 	logger         *Logger
 	s3Bucket       string   // S3 bucket name (optional)
 	s3Prefix       string   // S3 prefix/path within the bucket (optional)
@@ -44,22 +44,26 @@ func NewDataMatrix(config *DataMatrixConfig) (*DataMatrix, error) {
 	// Log initial memory usage
 	logger.Memory("Initial memory usage: %s", GetMemoryUsageSummary())
 
-	// Create a new data dictionary
-	dataDictionary := NewDataDictionary(logger)
-	
 	// Set default data directory if not specified
 	dataDir := "data"
 	if config != nil && config.DataDir != "" {
 		dataDir = config.DataDir
 	}
 	
+	// Create a new JSON asset manager
+	assetManager, err := NewJSONAssetManager(logger, dataDir)
+	if err != nil {
+		logger.Error("Error creating JSON asset manager: %v", err)
+		return nil, err
+	}
+	
 	// Set ID prefix filter if specified
 	if config != nil && len(config.IDPrefixFilter) > 0 {
-		dataDictionary.SetIDPrefixWhitelist(config.IDPrefixFilter)
+		assetManager.SetIDPrefixFilter(config.IDPrefixFilter)
 	}
 
 	dm := &DataMatrix{
-		dataDictionary: dataDictionary,
+		assetManager:   assetManager,
 		logger:         logger,
 		s3Bucket:       config.S3Bucket,
 		s3Prefix:       config.S3Prefix,
@@ -153,27 +157,23 @@ func (dm *DataMatrix) loadData() error {
 		dm.logger.Success("Found %d CSV files in example-data directory and subdirectories (up to 2 levels deep)", len(csvFiles))
 	}
 
-	// Load the CSV files into our data dictionary
-	dm.logger.Info("Loading CSV files into data dictionary...")
+	// Load the CSV files into our JSON asset store
+	dm.logger.Info("Loading CSV files into JSON asset store...")
 	
-	// Load all CSV files into the data dictionary
-	err = dm.dataDictionary.LoadFiles(csvFiles)
+	// Load all CSV files into the JSON asset store
+	err = dm.assetManager.LoadFiles(csvFiles)
 	if err != nil {
-		return fmt.Errorf("error loading CSV files into data dictionary: %v", err)
+		return fmt.Errorf("error loading CSV files into JSON asset store: %v", err)
 	}
 	
-	// Check if we have any data
-	if len(dm.dataDictionary.Data) == 0 {
-		return fmt.Errorf("no valid records with ID_BB_GLOBAL column found")
-	}
-	
-	dm.logger.Success("Loaded BB_ASSETS table with %d rows and %d columns", 
-		len(dm.dataDictionary.Data), len(dm.dataDictionary.Columns))
+	// Success message - we don't need to check for empty data as files are stored on disk
+	dm.logger.Success("Loaded CSV files into JSON asset store with %d columns", 
+		len(dm.assetManager.GetColumns()))
 	return nil
 }
 
 func (dm *DataMatrix) Close() error {
-	// Nothing to close with our in-memory implementation
+	// Nothing special to close with our file-based implementation
 	dm.logger.Info("Closing DataMatrix...")
 	dm.logger.Success("DataMatrix closed successfully")
 	return nil
@@ -190,9 +190,10 @@ func (dm *DataMatrix) handleGetColumns(w http.ResponseWriter, r *http.Request) {
 	defer dm.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
+	columns := dm.assetManager.GetColumns()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"columns": dm.dataDictionary.Columns,
-		"count":   len(dm.dataDictionary.Columns),
+		"columns": columns,
+		"count":   len(columns),
 	})
 }
 
@@ -277,15 +278,16 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 		sqlQuery += " WHERE " + params.Where
 	}
 
-	// Execute the query against our data dictionary
-	result, err := dm.dataDictionary.ExecuteSQLQuery(sqlQuery)
+	// Execute the query against our JSON asset store
+	result, err := dm.assetManager.ExecuteSQLQuery(sqlQuery)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Query error: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Get total count
-	total := int64(len(dm.dataDictionary.Data))
+	// For total count, we'll use the result count as an approximation
+	// since we don't keep a full list of IDs in memory anymore
+	total := int64(len(result))
 
 	// Convert result from []map[string]string to []map[string]interface{}
 	interfaceResult := make([]map[string]interface{}, len(result))
@@ -307,7 +309,7 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 // @title DataMatrix API
 // @version 1.0
-// @description A Go service that loads CSV files into an in-memory data dictionary and provides an HTTP API for querying the data using a minimal SQL dialect.
+// @description A Go service that loads CSV files into a JSON-based file store and provides an HTTP API for querying the data using a minimal SQL dialect.
 // @host localhost:8080
 // @BasePath /
 
