@@ -1,0 +1,86 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Push events to matching v*, i.e. v1.0, v20.15.10
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+            platform: macOS-arm64
+          - goos: linux
+            goarch: amd64
+            platform: amazon-linux-amd64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'  # Adjust to your Go version
+
+      - name: Get dependencies
+        run: go mod download
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          # Create output directory
+          mkdir -p dist
+          
+          # Build binary
+          go build -o dist/datamatrix-${{ matrix.platform }} .
+          
+          # Create archive with binary and README
+          if [ "${{ matrix.goos }}" == "windows" ]; then
+            zip -j dist/datamatrix-${{ matrix.platform }}.zip dist/datamatrix-${{ matrix.platform }} README.md
+          else
+            tar -czf dist/datamatrix-${{ matrix.platform }}.tar.gz -C dist datamatrix-${{ matrix.platform }} -C .. README.md
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: datamatrix-${{ matrix.platform }}
+          path: dist/datamatrix-${{ matrix.platform }}.*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/datamatrix-macOS-arm64/*
+            artifacts/datamatrix-amazon-linux-amd64/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
