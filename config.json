@@ -1,0 +1,7 @@
+{
+  "s3_bucket": "some-bucket-dev-us-east-1",
+  "s3_prefix": "data/",
+  "data_dir": "data",
+  "dir_whitelist": ["financial", "company", "market"],
+  "id_prefix_filter": ["BBG", "ISIN"]
+}
