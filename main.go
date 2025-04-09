@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,27 +10,29 @@ import (
 	"sync"
 
 	"github.com/gorilla/mux"
-	_ "github.com/marcboeker/go-duckdb"
 	httpSwagger "github.com/swaggo/http-swagger"
 	_ "datamatrix/docs" // Import generated docs
 )
 
-// DataMatrix manages the in-memory DuckDB instance
+// DataMatrix manages the in-memory data dictionary
 type DataMatrix struct {
 	sync.RWMutex
-	db      *sql.DB
-	columns []string
-	logger  *Logger
-	s3Bucket string // S3 bucket name (optional)
-	s3Prefix string // S3 prefix/path within the bucket (optional)
-	dataDir  string // Local directory for downloaded S3 files
+	dataDictionary *DataDictionary
+	logger         *Logger
+	s3Bucket       string   // S3 bucket name (optional)
+	s3Prefix       string   // S3 prefix/path within the bucket (optional)
+	dataDir        string   // Local directory for downloaded S3 files
+	dirWhitelist   []string // Optional whitelist of directory names
+	idPrefixFilter []string // Optional ID_BB_GLOBAL prefix filter
 }
 
 // DataMatrixConfig holds configuration for DataMatrix initialization
 type DataMatrixConfig struct {
-	S3Bucket string // Optional S3 bucket name
-	S3Prefix string // Optional S3 prefix/path within the bucket
-	DataDir  string // Directory for downloaded S3 files (default: "data")
+	S3Bucket       string   // Optional S3 bucket name
+	S3Prefix       string   // Optional S3 prefix/path within the bucket
+	DataDir        string   // Directory for downloaded S3 files (default: "data")
+	DirWhitelist   []string // Optional whitelist of directory names
+	IDPrefixFilter []string // Optional ID_BB_GLOBAL prefix filter
 }
 
 func NewDataMatrix(config *DataMatrixConfig) (*DataMatrix, error) {
@@ -42,30 +43,32 @@ func NewDataMatrix(config *DataMatrixConfig) (*DataMatrix, error) {
 	// Log initial memory usage
 	logger.Memory("Initial memory usage: %s", GetMemoryUsageSummary())
 
-	// Open an in-memory DuckDB database
-	db, err := sql.Open("duckdb", "")
-	if err != nil {
-		logger.Error("Error opening DuckDB: %v", err)
-		return nil, fmt.Errorf("error opening DuckDB: %v", err)
-	}
-
+	// Create a new data dictionary
+	dataDictionary := NewDataDictionary(logger)
+	
 	// Set default data directory if not specified
 	dataDir := "data"
 	if config != nil && config.DataDir != "" {
 		dataDir = config.DataDir
 	}
+	
+	// Set ID prefix filter if specified
+	if config != nil && len(config.IDPrefixFilter) > 0 {
+		dataDictionary.SetIDPrefixWhitelist(config.IDPrefixFilter)
+	}
 
 	dm := &DataMatrix{
-		db:       db,
-		logger:   logger,
-		s3Bucket: config.S3Bucket,
-		s3Prefix: config.S3Prefix,
-		dataDir:  dataDir,
+		dataDictionary: dataDictionary,
+		logger:         logger,
+		s3Bucket:       config.S3Bucket,
+		s3Prefix:       config.S3Prefix,
+		dataDir:        dataDir,
+		dirWhitelist:   config.DirWhitelist,
+		idPrefixFilter: config.IDPrefixFilter,
 	}
 
 	if err := dm.loadData(); err != nil {
 		logger.Error("Error loading data: %v", err)
-		db.Close()
 		return nil, err
 	}
 
@@ -122,7 +125,7 @@ func (dm *DataMatrix) loadData() error {
 		}
 		
 		// Try to load from S3
-		s3Files, s3Err := CopyS3FilesToLocal(dm.logger, dm.s3Bucket, dm.s3Prefix, dm.dataDir)
+		s3Files, s3Err := CopyS3FilesToLocal(dm.logger, dm.s3Bucket, dm.s3Prefix, dm.dataDir, dm.dirWhitelist, dm.idPrefixFilter)
 		if s3Err == nil {
 			// S3 loading succeeded
 			csvFiles = s3Files
@@ -149,147 +152,30 @@ func (dm *DataMatrix) loadData() error {
 		dm.logger.Success("Found %d CSV files in example-data directory and subdirectories (up to 2 levels deep)", len(csvFiles))
 	}
 
-	// Create temporary views for each CSV file and collect column information
-	dm.logger.Info("Creating temporary views for CSV files...")
-	validFiles := make([]string, 0)
-	for _, filePath := range csvFiles {
-		// Create a unique view name based on the file path
-		relPath, err := filepath.Rel("example-data", filePath)
-		if err != nil {
-			dm.logger.Error("Error getting relative path for %s: %v", filePath, err)
-			continue
-		}
-		
-		// Create a safe view name by replacing non-alphanumeric characters
-		viewName := "temp_" + strings.ReplaceAll(
-			strings.ReplaceAll(
-				strings.ReplaceAll(relPath, "/", "_"),
-				"\\", "_"),
-			".", "_")
-		
-		// Create a temporary view for the CSV (handles both regular and gzipped CSVs)
-		dm.logger.Debug("Creating view for %s as %s", filePath, viewName)
-		
-		// DuckDB can automatically detect and handle gzipped files
-		_, err = dm.db.Exec(fmt.Sprintf("CREATE VIEW %s AS SELECT * FROM read_csv_auto('%s')", viewName, filePath))
-		if err != nil {
-			dm.logger.Error("Error creating view for %s: %v", filePath, err)
-			continue
-		}
-
-		// Check if ID_BB_GLOBAL exists in this file
-		var hasIDColumn bool
-		row := dm.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) > 0 FROM pragma_table_info('%s') WHERE name = 'ID_BB_GLOBAL'", viewName))
-		err = row.Scan(&hasIDColumn)
-		if err != nil {
-			dm.logger.Error("Error checking for ID_BB_GLOBAL in %s: %v", filePath, err)
-			dm.db.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", viewName))
-			continue
-		}
-
-		if !hasIDColumn {
-			dm.logger.Warn("Skipping file %s: No ID_BB_GLOBAL column found", filePath)
-			dm.db.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", viewName))
-			continue
-		}
-
-		validFiles = append(validFiles, viewName)
-		dm.logger.Success("Added valid CSV file: %s", filePath)
-	}
-
-	if len(validFiles) == 0 {
-		return fmt.Errorf("no valid files with ID_BB_GLOBAL column found")
-	}
-
-	// Create the final aggregated query
-	query := "WITH all_ids AS (SELECT DISTINCT ID_BB_GLOBAL FROM ("
-	for i, view := range validFiles {
-		if i > 0 {
-			query += " UNION "
-		}
-		query += fmt.Sprintf("SELECT ID_BB_GLOBAL FROM %s", view)
-	}
-	query += "))\nSELECT all_ids.ID_BB_GLOBAL"
-
-	// Add columns from each valid file
-	columnMap := make(map[string]bool)
-	columnMap["ID_BB_GLOBAL"] = true
-
-	for _, view := range validFiles {
-		rows, err := dm.db.Query(fmt.Sprintf("SELECT name FROM pragma_table_info('%s') WHERE name != 'ID_BB_GLOBAL'", view))
-		if err != nil {
-			dm.logger.Error("Error getting columns for %s: %v", view, err)
-			continue
-		}
-
-		for rows.Next() {
-			var colName string
-			if err := rows.Scan(&colName); err != nil {
-				rows.Close()
-				dm.logger.Error("Error scanning column name: %v", err)
-				continue
-			}
-			if !columnMap[colName] {
-				columnMap[colName] = true
-				query += fmt.Sprintf(",\n\tMAX(%s.%s) as %s", view, colName, colName)
-			}
-		}
-		rows.Close()
-	}
-
-	query += "\nFROM all_ids"
-	for _, view := range validFiles {
-		query += fmt.Sprintf("\nLEFT JOIN %s ON all_ids.ID_BB_GLOBAL = %s.ID_BB_GLOBAL", view, view)
-	}
-	query += "\nGROUP BY all_ids.ID_BB_GLOBAL"
-
-	// Create the final in-memory table
-	_, err = dm.db.Exec("CREATE TABLE data_matrix AS " + query)
+	// Load the CSV files into our data dictionary
+	dm.logger.Info("Loading CSV files into data dictionary...")
+	
+	// Load all CSV files into the data dictionary
+	err = dm.dataDictionary.LoadFiles(csvFiles)
 	if err != nil {
-		return fmt.Errorf("error creating final table: %v", err)
+		return fmt.Errorf("error loading CSV files into data dictionary: %v", err)
 	}
-
-	// Clean up temporary views
-	for _, view := range validFiles {
-		dm.db.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", view))
+	
+	// Check if we have any data
+	if len(dm.dataDictionary.Data) == 0 {
+		return fmt.Errorf("no valid records with ID_BB_GLOBAL column found")
 	}
-
-	// Get column information
-	rows, err := dm.db.Query("SELECT name FROM pragma_table_info('data_matrix')")
-	if err != nil {
-		return fmt.Errorf("error getting columns: %v", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var colName string
-		if err := rows.Scan(&colName); err != nil {
-			return fmt.Errorf("error scanning column name: %v", err)
-		}
-		dm.columns = append(dm.columns, colName)
-	}
-
-	// Get row count
-	var rowCount int64
-	row := dm.db.QueryRow("SELECT COUNT(*) FROM data_matrix")
-	err = row.Scan(&rowCount)
-	if err != nil {
-		return fmt.Errorf("error counting rows: %v", err)
-	}
-
-	dm.logger.Success("Loaded data_matrix table with %d rows and %d columns", rowCount, len(dm.columns))
+	
+	dm.logger.Success("Loaded BB_ASSETS table with %d rows and %d columns", 
+		len(dm.dataDictionary.Data), len(dm.dataDictionary.Columns))
 	return nil
 }
 
 func (dm *DataMatrix) Close() error {
-	dm.logger.Info("Closing database connection...")
-	err := dm.db.Close()
-	if err != nil {
-		dm.logger.Error("Error closing database: %v", err)
-	} else {
-		dm.logger.Success("Database closed successfully")
-	}
-	return err
+	// Nothing to close with our in-memory implementation
+	dm.logger.Info("Closing DataMatrix...")
+	dm.logger.Success("DataMatrix closed successfully")
+	return nil
 }
 
 // @Summary Get all available columns
@@ -304,8 +190,8 @@ func (dm *DataMatrix) handleGetColumns(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"columns": dm.columns,
-		"count":   len(dm.columns),
+		"columns": dm.dataDictionary.Columns,
+		"count":   len(dm.dataDictionary.Columns),
 	})
 }
 
@@ -384,65 +270,35 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 		columnList = strings.Join(columnParts, ", ")
 	}
 
-	query := fmt.Sprintf("SELECT %s FROM data_matrix", columnList)
+	// Build a SQL query string for our custom implementation
+	sqlQuery := "SELECT " + columnList + " FROM BB_ASSETS"
 	if params.Where != "" {
-		query += " WHERE " + params.Where
-	}
-	if params.Limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", params.Limit)
-	}
-	if params.Offset > 0 {
-		query += fmt.Sprintf(" OFFSET %d", params.Offset)
+		sqlQuery += " WHERE " + params.Where
 	}
 
-	// Execute query
-	rows, err := dm.db.Query(query)
+	// Execute the query against our data dictionary
+	result, err := dm.dataDictionary.ExecuteSQLQuery(sqlQuery)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Query error: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
-
-	// Get column names from the query result
-	columns, err := rows.Columns()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Error getting columns: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Prepare result
-	var result []map[string]interface{}
-	values := make([]interface{}, len(columns))
-	valuePtrs := make([]interface{}, len(columns))
-	for i := range values {
-		valuePtrs[i] = &values[i]
-	}
-
-	for rows.Next() {
-		err := rows.Scan(valuePtrs...)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Error scanning row: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		row := make(map[string]interface{})
-		for i, col := range columns {
-			row[col] = values[i]
-		}
-		result = append(result, row)
-	}
 
 	// Get total count
-	var total int64
-	row := dm.db.QueryRow("SELECT COUNT(*) FROM data_matrix")
-	err = row.Scan(&total)
-	if err != nil {
-		dm.logger.Error("Error getting total count: %v", err)
+	total := int64(len(dm.dataDictionary.Data))
+
+	// Convert result from []map[string]string to []map[string]interface{}
+	interfaceResult := make([]map[string]interface{}, len(result))
+	for i, row := range result {
+		interfaceRow := make(map[string]interface{})
+		for k, v := range row {
+			interfaceRow[k] = v
+		}
+		interfaceResult[i] = interfaceRow
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(QueryResponse{
-		Data:  result,
+		Data:  interfaceResult,
 		Count: len(result),
 		Total: total,
 	})
@@ -450,7 +306,7 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 // @title DataMatrix API
 // @version 1.0
-// @description A Go service that loads CSV files into an in-memory DuckDB database and provides an HTTP API for querying the data using SQL.
+// @description A Go service that loads CSV files into an in-memory data dictionary and provides an HTTP API for querying the data using a minimal SQL dialect.
 // @host localhost:8080
 // @BasePath /
 func main() {
@@ -487,6 +343,28 @@ func main() {
 		config.S3Bucket = bucketName
 		config.S3Prefix = prefix
 		config.DataDir = "data" // Default data directory for S3 downloads
+		
+		// Check for directory whitelist
+		dirWhitelist := os.Getenv("DIR_WHITELIST")
+		if dirWhitelist != "" {
+			whitelistPatterns := strings.Split(dirWhitelist, ",")
+			config.DirWhitelist = whitelistPatterns
+			logger.Info("Directory whitelist specified with %d patterns", len(whitelistPatterns))
+			for _, pattern := range whitelistPatterns {
+				logger.Debug("Directory whitelist pattern: %s", pattern)
+			}
+		}
+		
+		// Check for ID_BB_GLOBAL prefix filter
+		idPrefixFilter := os.Getenv("ID_PREFIX_FILTER")
+		if idPrefixFilter != "" {
+			prefixPatterns := strings.Split(idPrefixFilter, ",")
+			config.IDPrefixFilter = prefixPatterns
+			logger.Info("ID_BB_GLOBAL prefix filter specified with %d patterns", len(prefixPatterns))
+			for _, pattern := range prefixPatterns {
+				logger.Debug("ID_BB_GLOBAL prefix pattern: %s", pattern)
+			}
+		}
 	}
 	
 	// Create the DataMatrix

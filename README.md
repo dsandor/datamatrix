@@ -30,7 +30,16 @@ You can also load data directly from an S3 bucket:
 
 2. Ensure AWS credentials are properly configured (via environment variables, credentials file, or IAM role)
 
-3. Start the server:
+3. Optionally, configure directory whitelist and ID_BB_GLOBAL prefix filters:
+   ```bash
+   # Directory whitelist - only process directories matching these patterns
+   export DIR_WHITELIST="equity,^bond/.*,fx$"
+   
+   # ID_BB_GLOBAL prefix filter - only include IDs matching these patterns
+   export ID_PREFIX_FILTER="BBG00,^US\d+,.*EQUITY$"
+   ```
+
+4. Start the server:
    ```bash
    go run main.go
    ```
@@ -41,6 +50,70 @@ When using S3 integration:
 - Files are downloaded to a local `data` directory, preserving the original S3 directory structure
 - Gzipped CSV files (`.csv.gz` or `.gz`) are read directly without decompression
 - Only files with an `ID_BB_GLOBAL` column will be included in the final data matrix
+
+#### Directory Whitelist and ID Filtering
+
+You can control which data gets loaded using two filtering mechanisms:
+
+1. **Directory Whitelist**: Specify which S3 directories to process using regex patterns or simple strings.
+   - Set via the `DIR_WHITELIST` environment variable as a comma-separated list
+   - If not specified, all directories will be processed
+
+2. **ID_BB_GLOBAL Prefix Filter**: Specify which ID_BB_GLOBAL values to include using regex patterns or simple prefixes.
+   - Set via the `ID_PREFIX_FILTER` environment variable as a comma-separated list
+   - If not specified, all ID_BB_GLOBAL values will be included
+
+##### Directory Whitelist Examples
+
+1. **Include only directories with "equity" in the name**:
+   ```bash
+   export DIR_WHITELIST="equity"
+   ```
+   This will match directories like `equity`, `equity/us`, `global/equity`, etc.
+
+2. **Include everything except directories with "bulk" in the name**:
+   ```bash
+   export DIR_WHITELIST="^((?!bulk).)*$"
+   ```
+   This negative lookahead regex will match any directory that doesn't contain "bulk".
+
+3. **Include multiple specific patterns**:
+   ```bash
+   export DIR_WHITELIST="equity,^bond/.*,fx$"
+   ```
+   This will include directories containing "equity", starting with "bond/", or ending with "fx".
+
+4. **Include only top-level directories (no subdirectories)**:
+   ```bash
+   export DIR_WHITELIST="^[^/]+$"
+   ```
+   This will match directories that don't contain a forward slash.
+
+##### ID_BB_GLOBAL Prefix Filter Examples
+
+1. **Include only Bloomberg IDs starting with BBG0**:
+   ```bash
+   export ID_PREFIX_FILTER="BBG0"
+   ```
+   This will match IDs like `BBG000B9XRY4`, `BBG00DL8NMV2`, etc.
+
+2. **Include all BBG IDs with wildcard**:
+   ```bash
+   export ID_PREFIX_FILTER="^BBG.*"
+   ```
+   This regex will match any ID starting with "BBG".
+
+3. **Include only equity securities**:
+   ```bash
+   export ID_PREFIX_FILTER=".*EQUITY$"
+   ```
+   This will match IDs ending with "EQUITY".
+
+4. **Include multiple ID types**:
+   ```bash
+   export ID_PREFIX_FILTER="BBG0,^US\d+,.*EQUITY$"
+   ```
+   This will include IDs starting with "BBG0", matching the pattern "US" followed by digits, or ending with "EQUITY".
 
 ## How It Works
 
@@ -138,12 +211,53 @@ Response:
 ```
 
 ## Features
-1. Uses DuckDB as the in-memory SQL query engine
+1. Uses a custom in-memory data dictionary for SQL-like querying
 2. Automatically loads and merges CSV files from the example-data directory and its subdirectories (up to 2 levels deep)
 3. Skips files without an ID_BB_GLOBAL column
 4. Creates a wide table with one row per ID_BB_GLOBAL
-5. Provides a REST API for querying the data with SQL
-6. Thread-safe access to the database
-7. Supports full SQL querying capabilities through DuckDB
-8. Case-insensitive column names in queries (e.g., "revenue", "REVENUE", and "Revenue" all work)
+5. Provides a REST API for querying the data with a minimal SQL dialect
+6. Thread-safe access to the data
+7. Supports directory whitelist filtering for S3 loading
+8. Supports ID_BB_GLOBAL prefix filtering
+9. Case-insensitive column names in queries (e.g., "revenue", "REVENUE", and "Revenue" all work)
+
+## Cross-Compilation
+
+### Building for Linux AMD64 (Amazon Linux 2)
+
+To cross-compile the application for Linux AMD64 (suitable for Amazon Linux 2 AMI), follow these steps:
+
+1. Set the necessary environment variables for cross-compilation:
+
+```bash
+export GOOS=linux
+export GOARCH=amd64
+export CGO_ENABLED=0  # Disable CGO for pure Go compilation
+```
+
+2. Build the application:
+
+```bash
+go build -o datamatrix-linux-amd64 .
+```
+
+3. Make the binary executable (if needed):
+
+```bash
+chmod +x datamatrix-linux-amd64
+```
+
+4. Transfer the binary to your Amazon Linux 2 instance:
+
+```bash
+scp datamatrix-linux-amd64 ec2-user@your-instance-ip:/path/to/destination/
+```
+
+5. On the Amazon Linux 2 instance, run the application:
+
+```bash
+./datamatrix-linux-amd64
+```
+
+Note: Since the application uses pure Go without CGO dependencies, it can be easily cross-compiled for different platforms without additional dependencies.
 
