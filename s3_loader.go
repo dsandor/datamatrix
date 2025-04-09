@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -27,14 +28,16 @@ type S3File struct {
 
 // S3Loader handles loading data from S3
 type S3Loader struct {
-	client  *s3.Client
-	logger  *Logger
-	dataDir string // Local directory to store downloaded files
-	prefix  string // Optional prefix within the bucket
+	client          *s3.Client
+	logger          *Logger
+	dataDir         string   // Local directory to store downloaded files
+	prefix          string   // Optional prefix within the bucket
+	dirWhitelist    []string // Optional whitelist of directory names
+	idPrefixFilter  []string // Optional ID_BB_GLOBAL prefix filter
 }
 
 // NewS3Loader creates a new S3Loader instance
-func NewS3Loader(logger *Logger, dataDir string, prefix string) (*S3Loader, error) {
+func NewS3Loader(logger *Logger, dataDir string, prefix string, dirWhitelist []string, idPrefixFilter []string) (*S3Loader, error) {
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("error creating data directory: %v", err)
@@ -50,10 +53,12 @@ func NewS3Loader(logger *Logger, dataDir string, prefix string) (*S3Loader, erro
 	client := s3.NewFromConfig(cfg)
 
 	return &S3Loader{
-		client:  client,
-		logger:  logger,
-		dataDir: dataDir,
-		prefix:  prefix,
+		client:         client,
+		logger:         logger,
+		dataDir:        dataDir,
+		prefix:         prefix,
+		dirWhitelist:   dirWhitelist,
+		idPrefixFilter: idPrefixFilter,
 	}, nil
 }
 
@@ -133,12 +138,38 @@ func (s *S3Loader) ListBucketContents(bucketName string) ([]S3File, error) {
 }
 
 // GroupFilesByDirectory groups files by their directory path
+// If a directory whitelist is provided, only directories containing any of the whitelist terms will be included
 func (s *S3Loader) GroupFilesByDirectory(files []S3File) map[string][]S3File {
 	s.logger.Info("Grouping files by directory")
 	
 	// Group files by directory
 	dirMap := make(map[string][]S3File)
 	for _, file := range files {
+		// Check if we should include this directory based on the whitelist
+		if len(s.dirWhitelist) > 0 {
+			includeDir := false
+			for _, pattern := range s.dirWhitelist {
+				// Try to compile as regex first
+				regex, err := regexp.Compile(pattern)
+				if err == nil {
+					// It's a valid regex pattern
+					if regex.MatchString(file.Directory) {
+						includeDir = true
+						break
+					}
+				} else {
+					// Fallback to simple string contains for backward compatibility
+					if strings.Contains(strings.ToLower(file.Directory), strings.ToLower(pattern)) {
+						includeDir = true
+						break
+					}
+				}
+			}
+			if !includeDir {
+				continue
+			}
+		}
+		
 		dirMap[file.Directory] = append(dirMap[file.Directory], file)
 	}
 
@@ -326,7 +357,7 @@ func (s *S3Loader) CleanupDataDirectory() error {
 }
 
 // CopyS3FilesToLocal copies files from S3 to a local directory
-func CopyS3FilesToLocal(logger *Logger, bucketName, prefix, dataDir string) ([]string, error) {
+func CopyS3FilesToLocal(logger *Logger, bucketName, prefix, dataDir string, dirWhitelist []string, idPrefixFilter []string) ([]string, error) {
 	if prefix != "" {
 		logger.Info("Loading data from S3 bucket: %s with prefix: %s", bucketName, prefix)
 	} else {
@@ -334,9 +365,17 @@ func CopyS3FilesToLocal(logger *Logger, bucketName, prefix, dataDir string) ([]s
 	}
 	
 	// Create S3 loader
-	s3Loader, err := NewS3Loader(logger, dataDir, prefix)
+	s3Loader, err := NewS3Loader(logger, dataDir, prefix, dirWhitelist, idPrefixFilter)
 	if err != nil {
 		return nil, fmt.Errorf("error creating S3 loader: %v", err)
+	}
+	
+	// Log whitelist and filter settings
+	if len(dirWhitelist) > 0 {
+		logger.Info("Using directory whitelist: %v", dirWhitelist)
+	}
+	if len(idPrefixFilter) > 0 {
+		logger.Info("Using ID_BB_GLOBAL prefix filter: %v", idPrefixFilter)
 	}
 
 	// Clean up data directory before downloading
