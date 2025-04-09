@@ -188,8 +188,9 @@ func (s *S3Loader) GroupFilesByDirectory(files []S3File) map[string][]S3File {
 }
 
 // DownloadNewestFiles downloads the newest file from each directory
+// If the file already exists locally and has the same or newer timestamp, it won't be re-downloaded
 func (s *S3Loader) DownloadNewestFiles(bucketName string, dirMap map[string][]S3File) ([]string, error) {
-	s.logger.Info("Downloading newest files from each directory")
+	s.logger.Info("Checking for newest files from each directory")
 	
 	downloader := manager.NewDownloader(s.client)
 	var downloadedFiles []string
@@ -212,6 +213,32 @@ func (s *S3Loader) DownloadNewestFiles(bucketName string, dirMap map[string][]S3
 		// Create local file path with the exact same structure as in S3
 		localFilePath := filepath.Join(s.dataDir, newestFile.Key)
 		
+		// Check if the file already exists locally
+		fileInfo, err := os.Stat(localFilePath)
+		if err == nil {
+			// File exists, check if it's newer or same age as the S3 file
+			localModTime := fileInfo.ModTime()
+			
+			// If local file is newer or same age, skip download
+			if !localModTime.Before(newestFile.LastModified) {
+				s.logger.Info("Skipping download of %s - local file is up to date (local: %s, remote: %s)", 
+					newestFile.Key, 
+					localModTime.Format(time.RFC3339),
+					newestFile.LastModified.Format(time.RFC3339))
+				
+				// Verify the file is a valid CSV or gzipped CSV
+				if isValidDataFile(localFilePath) {
+					downloadedFiles = append(downloadedFiles, localFilePath)
+					continue
+				} else {
+					s.logger.Warn("Local file %s is not valid, will re-download", localFilePath)
+					// Continue to download as the local file is invalid
+				}
+			} else {
+				s.logger.Info("Local file %s is older than S3 version, will re-download", newestFile.Key)
+			}
+		}
+
 		// Create the file
 		s.logger.Debug("Downloading %s to %s", newestFile.Key, localFilePath)
 		file, err := os.Create(localFilePath)
@@ -220,11 +247,23 @@ func (s *S3Loader) DownloadNewestFiles(bucketName string, dirMap map[string][]S3
 			continue
 		}
 
-		// Download the file
+		// Create a custom S3 client with logging disabled for this operation
+		clientOptions := func(o *s3.Options) {
+			// Disable logging for this client to suppress checksum warnings
+			o.Logger = nil
+		}
+
+		// Set client options to suppress checksum warnings
+		downloadOptions := func(d *manager.Downloader) {
+			// Add the client options to suppress warnings
+			d.ClientOptions = append(d.ClientOptions, clientOptions)
+		}
+
+		// Download the file with modified options
 		_, err = downloader.Download(context.TODO(), file, &s3.GetObjectInput{
 			Bucket: aws.String(bucketName),
 			Key:    aws.String(newestFile.Key),
-		})
+		}, downloadOptions)
 		file.Close()
 
 		if err != nil {
@@ -238,6 +277,11 @@ func (s *S3Loader) DownloadNewestFiles(bucketName string, dirMap map[string][]S3
 			s.logger.Warn("Skipping file %s: Not a valid CSV or gzipped CSV file", newestFile.Key)
 			os.Remove(localFilePath) // Clean up invalid file
 			continue
+		}
+
+		// Set the file modification time to match the S3 file's LastModified time
+		if err := os.Chtimes(localFilePath, newestFile.LastModified, newestFile.LastModified); err != nil {
+			s.logger.Warn("Failed to set modification time for %s: %v", localFilePath, err)
 		}
 
 		s.logger.Success("Downloaded %s (%.2f MB, modified %s)", 
@@ -378,11 +422,7 @@ func CopyS3FilesToLocal(logger *Logger, bucketName, prefix, dataDir string, dirW
 		logger.Info("Using ID_BB_GLOBAL prefix filter: %v", idPrefixFilter)
 	}
 
-	// Clean up data directory before downloading
-	if err := s3Loader.CleanupDataDirectory(); err != nil {
-		logger.Warn("Error cleaning up data directory: %v", err)
-		// Continue anyway
-	}
+	// No longer cleaning up data directory before downloading to preserve existing files
 
 	// Load data from S3
 	downloadedFiles, err := s3Loader.LoadFromS3(bucketName)
