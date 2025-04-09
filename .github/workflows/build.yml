@@ -29,13 +29,29 @@ jobs:
         with:
           go-version: '1.21'  # Adjust to your Go version
 
-      - name: Get dependencies
+      - name: Install DuckDB dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+          
+          # Install DuckDB library
+          wget https://github.com/duckdb/duckdb/archive/refs/tags/v0.10.1.tar.gz
+          tar -xzf v0.10.1.tar.gz
+          cd duckdb-0.10.1
+          make
+          sudo make install
+          cd ..
+          
+      - name: Get Go dependencies
         run: go mod download
 
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+          CGO_CFLAGS: "-I/usr/local/include"
+          CGO_LDFLAGS: "-L/usr/local/lib -lduckdb"
         run: |
           # Create output directory
           mkdir -p dist
