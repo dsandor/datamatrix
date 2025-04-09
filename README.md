@@ -20,29 +20,62 @@ go mod tidy
    go run main.go
    ```
 
-### Loading from S3
-You can also load data directly from an S3 bucket:
+### Configuration Options
 
-1. Set the S3 bucket name as an environment variable:
-   ```bash
-   export S3_BUCKET="your-bucket-name"
-   ```
+You can configure DataMatrix using either a JSON configuration file or environment variables.
 
-2. Ensure AWS credentials are properly configured (via environment variables, credentials file, or IAM role)
+#### JSON Configuration File
 
-3. Optionally, configure directory whitelist and ID_BB_GLOBAL prefix filters:
-   ```bash
-   # Directory whitelist - only process directories matching these patterns
-   export DIR_WHITELIST="equity,^bond/.*,fx$"
-   
-   # ID_BB_GLOBAL prefix filter - only include IDs matching these patterns
-   export ID_PREFIX_FILTER="BBG00,^US\d+,.*EQUITY$"
-   ```
+Create a `config.json` file in the application directory or specify a custom path using the `CONFIG_FILE` environment variable:
 
-4. Start the server:
-   ```bash
-   go run main.go
-   ```
+```bash
+export CONFIG_FILE="/path/to/your/config.json"
+```
+
+Example configuration file:
+
+```json
+{
+  "s3_bucket": "your-bucket-name",
+  "s3_prefix": "data/",
+  "data_dir": "data",
+  "dir_whitelist": ["financial", "company", "market"],
+  "id_prefix_filter": ["BBG", "ISIN"]
+}
+```
+
+Configuration options:
+
+| Option | Description |
+|--------|-------------|
+| `s3_bucket` | S3 bucket name |
+| `s3_prefix` | Optional prefix/path within the bucket |
+| `data_dir` | Directory for downloaded files (default: "data") |
+| `dir_whitelist` | Optional list of directory patterns to include |
+| `id_prefix_filter` | Optional list of ID_BB_GLOBAL patterns to include |
+
+#### Environment Variables
+
+If no configuration file is found, you can use environment variables:
+
+```bash
+# S3 bucket name
+export S3_BUCKET="your-bucket-name"
+
+# Directory whitelist - only process directories matching these patterns
+export DIR_WHITELIST="equity,^bond/.*,fx$"
+
+# ID_BB_GLOBAL prefix filter - only include IDs matching these patterns
+export ID_PREFIX_FILTER="BBG00,^US\d+,.*EQUITY$"
+```
+
+#### Starting the Server
+
+After configuring with either method, start the server:
+
+```bash
+go run main.go
+```
 
 When using S3 integration:
 - The application will traverse the bucket and find all CSV files (both plain and gzipped)

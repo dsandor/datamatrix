@@ -28,11 +28,12 @@ type DataMatrix struct {
 
 // DataMatrixConfig holds configuration for DataMatrix initialization
 type DataMatrixConfig struct {
-	S3Bucket       string   // Optional S3 bucket name
-	S3Prefix       string   // Optional S3 prefix/path within the bucket
-	DataDir        string   // Directory for downloaded S3 files (default: "data")
-	DirWhitelist   []string // Optional whitelist of directory names
-	IDPrefixFilter []string // Optional ID_BB_GLOBAL prefix filter
+	S3Bucket       string   `json:"s3_bucket,omitempty"`       // Optional S3 bucket name
+	S3Prefix       string   `json:"s3_prefix,omitempty"`       // Optional S3 prefix/path within the bucket
+	DataDir        string   `json:"data_dir,omitempty"`        // Directory for downloaded S3 files (default: "data")
+	DirWhitelist   []string `json:"dir_whitelist,omitempty"`   // Optional whitelist of directory names
+	IDPrefixFilter []string `json:"id_prefix_filter,omitempty"` // Optional ID_BB_GLOBAL prefix filter
+	ConfigFile     string   `json:"-"`                         // Path to the configuration file (not stored in JSON)
 }
 
 func NewDataMatrix(config *DataMatrixConfig) (*DataMatrix, error) {
@@ -309,6 +310,54 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 // @description A Go service that loads CSV files into an in-memory data dictionary and provides an HTTP API for querying the data using a minimal SQL dialect.
 // @host localhost:8080
 // @BasePath /
+
+// loadConfigFromFile loads DataMatrix configuration from a JSON file
+func loadConfigFromFile(filePath string, logger *Logger) (*DataMatrixConfig, error) {
+	logger.Info("Loading configuration from file: %s", filePath)
+	
+	// Read the configuration file
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("error reading config file: %v", err)
+	}
+	
+	// Parse the JSON configuration
+	config := &DataMatrixConfig{}
+	if err := json.Unmarshal(data, config); err != nil {
+		return nil, fmt.Errorf("error parsing config file: %v", err)
+	}
+	
+	// Store the config file path
+	config.ConfigFile = filePath
+	
+	// Set default data directory if not specified
+	if config.DataDir == "" {
+		config.DataDir = "data"
+		logger.Info("No data directory specified in config, using default: %s", config.DataDir)
+	}
+	
+	// Log the configuration
+	if config.S3Bucket != "" {
+		logger.Info("S3 bucket specified in config: %s, prefix: %s", config.S3Bucket, config.S3Prefix)
+	}
+	
+	if len(config.DirWhitelist) > 0 {
+		logger.Info("Directory whitelist specified with %d patterns", len(config.DirWhitelist))
+		for _, pattern := range config.DirWhitelist {
+			logger.Debug("Directory whitelist pattern: %s", pattern)
+		}
+	}
+	
+	if len(config.IDPrefixFilter) > 0 {
+		logger.Info("ID_BB_GLOBAL prefix filter specified with %d patterns", len(config.IDPrefixFilter))
+		for _, pattern := range config.IDPrefixFilter {
+			logger.Debug("ID_BB_GLOBAL prefix pattern: %s", pattern)
+		}
+	}
+	
+	return config, nil
+}
+
 func main() {
 	// Create a logger for the main function
 	logger := NewLogger()
@@ -323,46 +372,76 @@ func main() {
 	}
 
 	// Create the DataMatrix configuration
-	config := &DataMatrixConfig{}
+	var config *DataMatrixConfig
 	
-	// Check if S3 bucket is specified as an environment variable
-	s3Path := os.Getenv("S3_BUCKET")
-	if s3Path != "" {
-		// Remove the s3:// prefix if present
-		s3Path = strings.TrimPrefix(s3Path, "s3://")
-		
-		// Split the path into bucket and prefix
-		parts := strings.SplitN(s3Path, "/", 2)
-		bucketName := parts[0]
-		prefix := ""
-		if len(parts) > 1 {
-			prefix = parts[1]
+	// Check if config file is specified as an environment variable or use default
+	configFile := os.Getenv("CONFIG_FILE")
+	if configFile != "" {
+		// Load configuration from file
+		var err error
+		config, err = loadConfigFromFile(configFile, logger)
+		if err != nil {
+			logger.Error("Error loading configuration from file: %v", err)
+			os.Exit(1)
 		}
-		
-		logger.Info("S3 bucket specified: %s, prefix: %s", bucketName, prefix)
-		config.S3Bucket = bucketName
-		config.S3Prefix = prefix
-		config.DataDir = "data" // Default data directory for S3 downloads
-		
-		// Check for directory whitelist
-		dirWhitelist := os.Getenv("DIR_WHITELIST")
-		if dirWhitelist != "" {
-			whitelistPatterns := strings.Split(dirWhitelist, ",")
-			config.DirWhitelist = whitelistPatterns
-			logger.Info("Directory whitelist specified with %d patterns", len(whitelistPatterns))
-			for _, pattern := range whitelistPatterns {
-				logger.Debug("Directory whitelist pattern: %s", pattern)
+		logger.Success("Configuration loaded from file: %s", configFile)
+	} else {
+		// Check if default config file exists
+		defaultConfigFile := "config.json"
+		if _, err := os.Stat(defaultConfigFile); err == nil {
+			// Load configuration from default file
+			var err error
+			config, err = loadConfigFromFile(defaultConfigFile, logger)
+			if err != nil {
+				logger.Error("Error loading configuration from default file: %v", err)
+				os.Exit(1)
 			}
-		}
-		
-		// Check for ID_BB_GLOBAL prefix filter
-		idPrefixFilter := os.Getenv("ID_PREFIX_FILTER")
-		if idPrefixFilter != "" {
-			prefixPatterns := strings.Split(idPrefixFilter, ",")
-			config.IDPrefixFilter = prefixPatterns
-			logger.Info("ID_BB_GLOBAL prefix filter specified with %d patterns", len(prefixPatterns))
-			for _, pattern := range prefixPatterns {
-				logger.Debug("ID_BB_GLOBAL prefix pattern: %s", pattern)
+			logger.Success("Configuration loaded from default file: %s", defaultConfigFile)
+		} else {
+			// No config file, use environment variables
+			logger.Info("No configuration file found, using environment variables")
+			config = &DataMatrixConfig{}
+			
+			// Check if S3 bucket is specified as an environment variable
+			s3Path := os.Getenv("S3_BUCKET")
+			if s3Path != "" {
+				// Remove the s3:// prefix if present
+				s3Path = strings.TrimPrefix(s3Path, "s3://")
+				
+				// Split the path into bucket and prefix
+				parts := strings.SplitN(s3Path, "/", 2)
+				bucketName := parts[0]
+				prefix := ""
+				if len(parts) > 1 {
+					prefix = parts[1]
+				}
+				
+				logger.Info("S3 bucket specified: %s, prefix: %s", bucketName, prefix)
+				config.S3Bucket = bucketName
+				config.S3Prefix = prefix
+				config.DataDir = "data" // Default data directory for S3 downloads
+				
+				// Check for directory whitelist
+				dirWhitelist := os.Getenv("DIR_WHITELIST")
+				if dirWhitelist != "" {
+					whitelistPatterns := strings.Split(dirWhitelist, ",")
+					config.DirWhitelist = whitelistPatterns
+					logger.Info("Directory whitelist specified with %d patterns", len(whitelistPatterns))
+					for _, pattern := range whitelistPatterns {
+						logger.Debug("Directory whitelist pattern: %s", pattern)
+					}
+				}
+				
+				// Check for ID_BB_GLOBAL prefix filter
+				idPrefixFilter := os.Getenv("ID_PREFIX_FILTER")
+				if idPrefixFilter != "" {
+					prefixPatterns := strings.Split(idPrefixFilter, ",")
+					config.IDPrefixFilter = prefixPatterns
+					logger.Info("ID_BB_GLOBAL prefix filter specified with %d patterns", len(prefixPatterns))
+					for _, pattern := range prefixPatterns {
+						logger.Debug("ID_BB_GLOBAL prefix pattern: %s", pattern)
+					}
+				}
 			}
 		}
 	}
