@@ -30,6 +30,7 @@ type S3File struct {
 type S3Loader struct {
 	client          *s3.Client
 	logger          *Logger
+	progress        *ProgressTracker
 	dataDir         string   // Local directory to store downloaded files
 	prefix          string   // Optional prefix within the bucket
 	dirWhitelist    []string // Optional whitelist of directory names
@@ -37,7 +38,7 @@ type S3Loader struct {
 }
 
 // NewS3Loader creates a new S3Loader instance
-func NewS3Loader(logger *Logger, dataDir string, prefix string, dirWhitelist []string, idPrefixFilter []string) (*S3Loader, error) {
+func NewS3Loader(logger *Logger, progress *ProgressTracker, dataDir string, prefix string, dirWhitelist []string, idPrefixFilter []string) (*S3Loader, error) {
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("error creating data directory: %v", err)
@@ -55,6 +56,7 @@ func NewS3Loader(logger *Logger, dataDir string, prefix string, dirWhitelist []s
 	return &S3Loader{
 		client:         client,
 		logger:         logger,
+		progress:       progress,
 		dataDir:        dataDir,
 		prefix:         prefix,
 		dirWhitelist:   dirWhitelist,
@@ -70,8 +72,12 @@ func (s *S3Loader) ListBucketContents(bucketName string) ([]S3File, error) {
 		s.logger.Info("Listing contents of S3 bucket: %s", bucketName)
 	}
 
+	// Start progress tracking
+	s.progress.StartProgress("Listing S3 files", 0)
+
 	var files []S3File
 	var continuationToken *string
+	pageCount := 0
 
 	// S3 returns paginated results, so we need to loop until we've got everything
 	for {
@@ -91,6 +97,10 @@ func (s *S3Loader) ListBucketContents(bucketName string) ([]S3File, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error listing S3 objects: %v", err)
 		}
+		
+		// Update progress
+		pageCount++
+		s.progress.UpdateProgress(pageCount, fmt.Sprintf("Listing S3 files (page %d)", pageCount))
 
 		// Process the objects in this page
 		for _, obj := range resp.Contents {
@@ -133,6 +143,8 @@ func (s *S3Loader) ListBucketContents(bucketName string) ([]S3File, error) {
 		}
 	}
 
+	// Complete progress
+	s.progress.CompleteProgress()
 	s.logger.Success("Found %d CSV files in bucket %s", len(files), bucketName)
 	return files, nil
 }
@@ -142,9 +154,14 @@ func (s *S3Loader) ListBucketContents(bucketName string) ([]S3File, error) {
 func (s *S3Loader) GroupFilesByDirectory(files []S3File) map[string][]S3File {
 	s.logger.Info("Grouping files by directory")
 	
+	// Start progress tracking
+	s.progress.StartProgress("Grouping files by directory", len(files))
+	
 	// Group files by directory
 	dirMap := make(map[string][]S3File)
-	for _, file := range files {
+	for i, file := range files {
+		// Update progress
+		s.progress.UpdateProgress(i+1, "")
 		// Check if we should include this directory based on the whitelist
 		if len(s.dirWhitelist) > 0 {
 			includeDir := false
@@ -183,6 +200,8 @@ func (s *S3Loader) GroupFilesByDirectory(files []S3File) map[string][]S3File {
 			dir, len(dirFiles), filepath.Base(dirFiles[0].Key), dirFiles[0].LastModified.Format(time.RFC3339))
 	}
 
+	// Complete progress
+	s.progress.CompleteProgress()
 	s.logger.Success("Grouped files into %d directories", len(dirMap))
 	return dirMap
 }
@@ -191,6 +210,10 @@ func (s *S3Loader) GroupFilesByDirectory(files []S3File) map[string][]S3File {
 // If the file already exists locally and has the same or newer timestamp, it won't be re-downloaded
 func (s *S3Loader) DownloadNewestFiles(bucketName string, dirMap map[string][]S3File) ([]string, error) {
 	s.logger.Info("Checking for newest files from each directory")
+	
+	// Count total files to download (one per directory)
+	totalDirs := len(dirMap)
+	s.progress.StartProgress("Downloading files", totalDirs)
 	
 	downloader := manager.NewDownloader(s.client)
 	var downloadedFiles []string
@@ -401,7 +424,7 @@ func (s *S3Loader) CleanupDataDirectory() error {
 }
 
 // CopyS3FilesToLocal copies files from S3 to a local directory
-func CopyS3FilesToLocal(logger *Logger, bucketName, prefix, dataDir string, dirWhitelist []string, idPrefixFilter []string) ([]string, error) {
+func CopyS3FilesToLocal(logger *Logger, progress *ProgressTracker, bucketName, prefix, dataDir string, dirWhitelist []string, idPrefixFilter []string) ([]string, error) {
 	if prefix != "" {
 		logger.Info("Loading data from S3 bucket: %s with prefix: %s", bucketName, prefix)
 	} else {
@@ -409,7 +432,7 @@ func CopyS3FilesToLocal(logger *Logger, bucketName, prefix, dataDir string, dirW
 	}
 	
 	// Create S3 loader
-	s3Loader, err := NewS3Loader(logger, dataDir, prefix, dirWhitelist, idPrefixFilter)
+	s3Loader, err := NewS3Loader(logger, progress, dataDir, prefix, dirWhitelist, idPrefixFilter)
 	if err != nil {
 		return nil, fmt.Errorf("error creating S3 loader: %v", err)
 	}

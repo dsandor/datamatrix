@@ -31,6 +31,7 @@ type AssetIndex struct {
 type JSONAssetManager struct {
 	sync.RWMutex
 	logger         *Logger
+	progress       *ProgressTracker
 	jsonDir        string   // Directory for JSON files
 	columns        []string // List of all columns
 	idPrefixFilter []string // Optional ID_BB_GLOBAL prefix filter
@@ -44,7 +45,7 @@ type JSONAssetManager struct {
 }
 
 // NewJSONAssetManager creates a new JSON asset manager
-func NewJSONAssetManager(logger *Logger, dataDir string) (*JSONAssetManager, error) {
+func NewJSONAssetManager(logger *Logger, progress *ProgressTracker, dataDir string) (*JSONAssetManager, error) {
 	// Create the JSON directory if it doesn't exist
 	jsonDir := filepath.Join(dataDir, "json")
 	if err := os.MkdirAll(jsonDir, 0755); err != nil {
@@ -56,6 +57,7 @@ func NewJSONAssetManager(logger *Logger, dataDir string) (*JSONAssetManager, err
 	
 	manager := &JSONAssetManager{
 		logger:        logger,
+		progress:      progress,
 		jsonDir:       jsonDir,
 		columns:       []string{},
 		Data:          make(map[string]map[string]string), // Empty map for interface compatibility
@@ -400,6 +402,9 @@ func (j *JSONAssetManager) GetColumns() []string {
 func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	j.logger.Info("Loading CSV file: %s", filePath)
 	
+	// Start progress tracking
+	j.progress.StartProgress(fmt.Sprintf("Loading %s", filepath.Base(filePath)), 0)
+	
 	// Extract the effective date from the filename
 	effectiveDate := j.getEffectiveDateFromFilename(filePath)
 	j.logger.Info("Effective date for file %s: %s", filepath.Base(filePath), effectiveDate)
@@ -456,6 +461,10 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	rowCount := 0
 	skippedCount := 0
 	updatedCount := 0
+	
+	// Update progress status
+	j.progress.SetStatus(fmt.Sprintf("Processing rows in %s", filepath.Base(filePath)))
+	
 	for {
 		record, err := csvReader.Read()
 		if err == io.EOF {
@@ -478,6 +487,12 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 			continue
 		}
 		
+		// Update progress with current row count
+		rowCount++
+		if rowCount % 100 == 0 { // Update every 100 rows to avoid excessive logging
+			j.progress.UpdateProgress(rowCount, fmt.Sprintf("Processed %d rows", rowCount))
+		}
+		
 		// Update the asset with the CSV data and track if updates were made
 		updated, err := j.UpdateAssetFromCSVWithDate(id, header, record, effectiveDate)
 		if err != nil {
@@ -498,6 +513,9 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 		j.logger.Warn("Error saving index file: %v", err)
 	}
 	
+	// Complete progress tracking
+	j.progress.CompleteProgress()
+	
 	j.logger.Success("Loaded %d rows from %s (updated %d, skipped %d rows)", 
 		rowCount, filepath.Base(filePath), updatedCount, skippedCount)
 	return nil
@@ -505,7 +523,12 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 
 // LoadFiles loads multiple CSV files and updates the JSON assets
 func (j *JSONAssetManager) LoadFiles(filePaths []string) error {
-	for _, filePath := range filePaths {
+	// Start progress tracking for overall file loading
+	j.progress.StartProgress("Loading CSV files", len(filePaths))
+	
+	for i, filePath := range filePaths {
+		// Update overall progress
+		j.progress.UpdateProgress(i+1, fmt.Sprintf("File %d of %d", i+1, len(filePaths)))
 		if err := j.LoadCSVFile(filePath); err != nil {
 			j.logger.Error("Error loading file %s: %v", filePath, err)
 			// Continue with other files
@@ -522,6 +545,12 @@ func (j *JSONAssetManager) LoadFiles(filePaths []string) error {
 	if err := j.saveIndex(); err != nil {
 		j.logger.Warn("Error saving index file: %v", err)
 	}
+	
+	// Complete overall progress tracking
+	j.progress.CompleteProgress()
+	
+	// Set system to idle state
+	j.progress.SetStatus("Idle - Ready for queries")
 	
 	j.logger.Success("Processed all files, total columns: %d, index entries: %d", 
 		len(j.columns), len(j.index.Entries))

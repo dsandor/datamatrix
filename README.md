@@ -190,6 +190,29 @@ The application uses a full trie directory structure to store JSON asset files e
 
 3. **Implementation**: The trie structure is automatically created when saving or accessing JSON files.
 
+## Progress Tracking
+
+The application includes a comprehensive progress tracking system to monitor file processing, row enumeration, and system status:
+
+### Key Features
+
+1. **S3 File Processing Progress**: Tracks the progress of listing, downloading, and processing files from S3.
+
+2. **Row Enumeration**: Monitors the progress of processing rows within each CSV file, showing counts and percentages.
+
+3. **Idle Status Detection**: Automatically detects when the system is idle and tracks idle duration.
+
+4. **Progress Bar Visualization**: Provides a visual representation of progress for operations with known total counts.
+
+5. **API Access**: Exposes progress information through the `/api/progress` endpoint for integration with monitoring tools or frontends.
+
+### Implementation Details
+
+- Progress updates are displayed in the console logs during processing.
+- The system automatically transitions to an idle state after 5 seconds of inactivity.
+- Progress tracking is thread-safe and can handle concurrent operations.
+- Status updates include both numeric progress (current/total) and percentage completion.
+
 ## How It Works
 
 The application:
@@ -201,7 +224,8 @@ The application:
 4. Maintains an index of column effective dates to ensure data freshness
 5. Stores data in JSON files using a full trie directory structure based on ID_BB_GLOBAL
 6. Keeps all data in an in-memory DuckDB database for fast SQL querying
-7. Exposes a REST API for querying the data
+7. Tracks progress of file processing and row enumeration with visual indicators
+8. Exposes a REST API for querying the data and monitoring progress
 
 ## API Endpoints
 
@@ -297,6 +321,37 @@ Response:
   ],
   "count": 2,
   "total": 6
+}
+```
+
+### GET /api/progress
+Returns the current progress status of file processing, row enumeration, and idle status.
+
+Response:
+```json
+{
+  "status": "Loading CSV files",
+  "current": 3,
+  "total": 5,
+  "percentage": 60,
+  "progress_bar": "[==================          ]",
+  "is_idle": false,
+  "display_string": "[==================          ] Loading CSV files (3/5) 60%"
+}
+```
+
+When the system is idle:
+```json
+{
+  "status": "Idle",
+  "current": 0,
+  "total": 0,
+  "percentage": 0,
+  "progress_bar": "[==============================]",
+  "is_idle": true,
+  "idle_time_seconds": 125.5,
+  "idle_time_formatted": "2m5s",
+  "display_string": "Status: Idle (for 2m5s)"
 }
 ```
 
