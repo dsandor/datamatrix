@@ -20,11 +20,14 @@ type ColumnIndex struct {
 	ID           string `json:"id"`           // ID_BB_GLOBAL
 	ColumnName   string `json:"column_name"`  // Column/property name
 	EffectiveDate string `json:"effective_date"` // Effective date in YYYYMMDD format
+	SourceFile   string `json:"source_file"`   // Source file where the column value was retrieved from
 }
 
-// AssetIndex holds the index data for all assets
-type AssetIndex struct {
-	Entries []ColumnIndex `json:"entries"`
+// AssetMetadata holds the metadata for a single asset
+type AssetMetadata struct {
+	ID        string        `json:"id"`        // ID_BB_GLOBAL
+	Columns   []ColumnIndex `json:"columns"`   // Column metadata with effective dates
+	UpdatedAt time.Time     `json:"updated_at"` // Last update timestamp
 }
 
 // JSONAssetManager manages the JSON files for BB_ASSETS
@@ -39,10 +42,12 @@ type JSONAssetManager struct {
 	// For compatibility with DataDictionary interface
 	Data map[string]map[string]string // This will be empty, just for interface compatibility
 	
-	// Index tracking
-	index         AssetIndex // Index of column effective dates
-	indexFilePath string     // Path to the index file
-	indexModified bool       // Flag to track if index was modified
+	// Column tracking
+	columnsMutex sync.RWMutex // Mutex for columns list
+	
+	// Cache of asset IDs for quick lookup
+	assetIDs      map[string]bool // Set of known asset IDs
+	assetIDsMutex sync.RWMutex   // Mutex for asset IDs map
 }
 
 // NewJSONAssetManager creates a new JSON asset manager
@@ -53,79 +58,92 @@ func NewJSONAssetManager(logger *Logger, progress *ProgressTracker, dataDir stri
 		return nil, fmt.Errorf("error creating JSON directory: %v", err)
 	}
 	
-	// Set up the index file path
-	indexFilePath := filepath.Join(dataDir, "asset_index.json")
-	
+	// Create the asset manager
 	manager := &JSONAssetManager{
 		logger:        logger,
 		progress:      progress,
 		jsonDir:       jsonDir,
 		columns:       []string{},
+		idPrefixFilter: []string{},
 		Data:          make(map[string]map[string]string), // Empty map for interface compatibility
-		indexFilePath: indexFilePath,
-		indexModified: false,
+		assetIDs:      make(map[string]bool),
 	}
 	
-	// Load the index file if it exists
-	if err := manager.loadIndex(); err != nil {
-		logger.Warn("Could not load index file: %v. Creating new index.", err)
+	// Check for legacy index file and migrate if needed
+	legacyIndexPath := filepath.Join(dataDir, "asset_index.json")
+	if err := manager.migrateFromLegacyIndex(legacyIndexPath); err != nil {
+		logger.Warn("Error migrating from legacy index: %v", err)
+	}
+	
+	// Scan existing assets to build column list and asset ID cache
+	if err := manager.scanExistingAssets(); err != nil {
+		logger.Warn("Could not scan existing assets: %v", err)
 	}
 	
 	return manager, nil
 }
 
 // loadIndex loads the index file if it exists
-func (j *JSONAssetManager) loadIndex() error {
-	j.Lock()
-	defer j.Unlock()
+// migrateFromLegacyIndex migrates data from the old single index file to per-asset metadata files
+// This is a one-time migration function that can be called if needed
+func (j *JSONAssetManager) migrateFromLegacyIndex(indexFilePath string) error {
+	j.logger.Info("Checking for legacy index file at %s", indexFilePath)
 	
-	// Check if the index file exists
-	if _, err := os.Stat(j.indexFilePath); os.IsNotExist(err) {
-		// Index file doesn't exist, initialize an empty index
-		j.index = AssetIndex{
-			Entries: []ColumnIndex{},
-		}
+	// Check if the legacy index file exists
+	if _, err := os.Stat(indexFilePath); os.IsNotExist(err) {
+		j.logger.Info("No legacy index file found, skipping migration")
 		return nil
 	}
 	
-	// Read the index file
-	data, err := os.ReadFile(j.indexFilePath)
+	// Read the legacy index file
+	data, err := os.ReadFile(indexFilePath)
 	if err != nil {
-		return fmt.Errorf("error reading index file: %v", err)
+		return fmt.Errorf("error reading legacy index file: %v", err)
 	}
 	
 	// Parse the JSON
-	if err := json.Unmarshal(data, &j.index); err != nil {
-		return fmt.Errorf("error parsing index file: %v", err)
+	type AssetIndex struct {
+		Entries []ColumnIndex `json:"entries"`
 	}
 	
-	j.logger.Info("Loaded index file with %d entries", len(j.index.Entries))
-	return nil
-}
-
-// saveIndex saves the index to the index file
-func (j *JSONAssetManager) saveIndex() error {
-	j.Lock()
-	defer j.Unlock()
-	
-	// Only save if the index was modified
-	if !j.indexModified {
-		return nil
+	var legacyIndex AssetIndex
+	if err := json.Unmarshal(data, &legacyIndex); err != nil {
+		return fmt.Errorf("error parsing legacy index file: %v", err)
 	}
 	
-	// Convert to JSON
-	data, err := json.MarshalIndent(j.index, "", "  ")
-	if err != nil {
-		return fmt.Errorf("error converting index to JSON: %v", err)
+	j.logger.Info("Migrating %d entries from legacy index file", len(legacyIndex.Entries))
+	
+	// Group entries by asset ID
+	assetEntries := make(map[string][]ColumnIndex)
+	for _, entry := range legacyIndex.Entries {
+		assetEntries[entry.ID] = append(assetEntries[entry.ID], entry)
 	}
 	
-	// Write to file
-	if err := os.WriteFile(j.indexFilePath, data, 0644); err != nil {
-		return fmt.Errorf("error writing index file: %v", err)
+	// Create metadata files for each asset
+	migratedCount := 0
+	for id, entries := range assetEntries {
+		metadata := &AssetMetadata{
+			ID:        id,
+			Columns:   entries,
+			UpdatedAt: time.Now(),
+		}
+		
+		if err := j.saveAssetMetadata(id, metadata); err != nil {
+			j.logger.Warn("Error saving metadata for asset %s: %v", id, err)
+			continue
+		}
+		
+		migratedCount++
 	}
 	
-	j.indexModified = false
-	j.logger.Info("Saved index file with %d entries", len(j.index.Entries))
+	j.logger.Success("Migrated %d assets from legacy index file", migratedCount)
+	
+	// Rename the legacy index file to indicate it's been migrated
+	backupPath := indexFilePath + ".migrated"
+	if err := os.Rename(indexFilePath, backupPath); err != nil {
+		j.logger.Warn("Error renaming legacy index file: %v", err)
+	}
+	
 	return nil
 }
 
@@ -146,44 +164,64 @@ func (j *JSONAssetManager) getEffectiveDateFromFilename(filename string) string 
 	return time.Now().Format("20060102")
 }
 
-// getColumnEffectiveDate gets the effective date for a column from the index
+// getColumnEffectiveDate gets the effective date for a column from the asset metadata
 func (j *JSONAssetManager) getColumnEffectiveDate(id, columnName string) string {
-	j.RLock()
-	defer j.RUnlock()
+	// Load the metadata for the asset
+	metadata, err := j.loadAssetMetadata(id)
+	if err != nil {
+		// If there's an error, just return empty string
+		return ""
+	}
 	
-	for _, entry := range j.index.Entries {
-		if entry.ID == id && entry.ColumnName == columnName {
-			return entry.EffectiveDate
+	// Look for the column in the metadata
+	for _, col := range metadata.Columns {
+		if col.ColumnName == columnName {
+			return col.EffectiveDate
 		}
 	}
 	
 	return "" // No effective date found
 }
 
-// updateColumnEffectiveDate updates the effective date for a column in the index
-func (j *JSONAssetManager) updateColumnEffectiveDate(id, columnName, effectiveDate string) {
-	j.Lock()
-	defer j.Unlock()
-	
-	// Check if the entry already exists
-	for i, entry := range j.index.Entries {
-		if entry.ID == id && entry.ColumnName == columnName {
-			// Only update if the new date is newer
-			if effectiveDate > entry.EffectiveDate {
-				j.index.Entries[i].EffectiveDate = effectiveDate
-				j.indexModified = true
-			}
-			return
+// updateColumnEffectiveDate updates the effective date for a column in the asset metadata
+func (j *JSONAssetManager) updateColumnEffectiveDate(id, columnName, effectiveDate, sourceFile string) error {
+	// Load the metadata for the asset
+	metadata, err := j.loadAssetMetadata(id)
+	if err != nil {
+		// If there's an error loading, create a new metadata file
+		metadata = &AssetMetadata{
+			ID:        id,
+			Columns:   []ColumnIndex{},
+			UpdatedAt: time.Now(),
 		}
 	}
 	
-	// Entry doesn't exist, add it
-	j.index.Entries = append(j.index.Entries, ColumnIndex{
-		ID:           id,
-		ColumnName:   columnName,
-		EffectiveDate: effectiveDate,
-	})
-	j.indexModified = true
+	// Check if the column already exists
+	columnExists := false
+	for i, col := range metadata.Columns {
+		if col.ColumnName == columnName {
+			// Only update if the new date is newer
+			if effectiveDate > col.EffectiveDate {
+				metadata.Columns[i].EffectiveDate = effectiveDate
+				metadata.Columns[i].SourceFile = sourceFile
+			}
+			columnExists = true
+			break
+		}
+	}
+	
+	// If the column doesn't exist, add it
+	if !columnExists {
+		metadata.Columns = append(metadata.Columns, ColumnIndex{
+			ID:            id,
+			ColumnName:    columnName,
+			EffectiveDate: effectiveDate,
+			SourceFile:    sourceFile,
+		})
+	}
+	
+	// Save the updated metadata
+	return j.saveAssetMetadata(id, metadata)
 }
 
 // SetIDPrefixFilter sets the ID_BB_GLOBAL prefix filter
@@ -313,13 +351,13 @@ func (j *JSONAssetManager) SaveAsset(id string, asset map[string]string) error {
 // This is kept for backward compatibility
 func (j *JSONAssetManager) UpdateAssetFromCSV(id string, header []string, record []string) error {
 	// Use current date as effective date for backward compatibility
-	_, err := j.UpdateAssetFromCSVWithDate(id, header, record, time.Now().Format("20060102"))
+	_, err := j.UpdateAssetFromCSVWithDate(id, header, record, time.Now().Format("20060102"), "manual_update")
 	return err
 }
 
 // UpdateAssetFromCSVWithDate updates an asset with data from a CSV record with effective date
 // Returns true if any values were updated, false otherwise
-func (j *JSONAssetManager) UpdateAssetFromCSVWithDate(id string, header []string, record []string, effectiveDate string) (bool, error) {
+func (j *JSONAssetManager) UpdateAssetFromCSVWithDate(id string, header []string, record []string, effectiveDate string, sourceFile string) (bool, error) {
 	// Check if the ID should be included based on the prefix filter
 	if !j.ShouldIncludeID(id) {
 		return false, nil
@@ -354,8 +392,10 @@ func (j *JSONAssetManager) UpdateAssetFromCSVWithDate(id string, header []string
 				// Update the value
 				asset[colName] = value
 				
-				// Update the effective date in the index
-				j.updateColumnEffectiveDate(id, colName, effectiveDate)
+				// Update the effective date in the metadata with source file information
+				if err := j.updateColumnEffectiveDate(id, colName, effectiveDate, sourceFile); err != nil {
+					j.logger.Warn("Error updating column metadata for %s.%s: %v", id, colName, err)
+				}
 				
 				updated = true
 				
@@ -505,7 +545,7 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 		}
 		
 		// Update the asset with the CSV data and track if updates were made
-		updated, err := j.UpdateAssetFromCSVWithDate(id, header, record, effectiveDate)
+		updated, err := j.UpdateAssetFromCSVWithDate(id, header, record, effectiveDate, filePath)
 		if err != nil {
 			j.logger.Warn("Error updating asset for ID %s: %v", id, err)
 			skippedCount++
@@ -517,13 +557,8 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 		}
 	}
 	
-	// Update progress to show we're saving the index
-	fileProgress.SetStatus(fmt.Sprintf("Saving index after processing %s", fileName))
-	
-	// Save the index after processing the file
-	if err := j.saveIndex(); err != nil {
-		j.logger.Warn("Error saving index file: %v", err)
-	}
+	// Update progress to show we're done processing the file
+	fileProgress.SetStatus(fmt.Sprintf("Completed processing %s", fileName))
 	
 	// Complete progress tracking
 	fileProgress.CompleteProgress(fmt.Sprintf("Completed processing %s", fileName))
@@ -607,13 +642,10 @@ func (j *JSONAssetManager) LoadFiles(filePaths []string) error {
 	j.Data["placeholder"] = map[string]string{"ID_BB_GLOBAL": "placeholder"}
 	j.Unlock()
 	
-	// Update progress to show we're saving the final index
-	j.progress.SetStatus("Saving final index after processing all files")
+	// Update progress to show we're finalizing processing
+	j.progress.SetStatus("Finalizing asset processing")
 	
-	// Make sure the index is saved after loading all files
-	if err := j.saveIndex(); err != nil {
-		j.logger.Warn("Error saving index file: %v", err)
-	}
+	// No need to save a central index anymore as we use per-asset metadata files
 	
 	// Complete overall progress tracking
 	j.progress.CompleteProgress("All CSV files processed successfully")
@@ -621,31 +653,198 @@ func (j *JSONAssetManager) LoadFiles(filePaths []string) error {
 	// Set system to idle state
 	j.progress.SetStatus("Idle - Ready for queries")
 	
-	j.logger.Success("Processed all files, total columns: %d, index entries: %d", 
-		len(j.columns), len(j.index.Entries))
+	j.assetIDsMutex.RLock()
+	assetCount := len(j.assetIDs)
+	j.assetIDsMutex.RUnlock()
+	
+	j.logger.Success("Processed all files, total columns: %d, total assets: %d", 
+		len(j.columns), assetCount)
 	return nil
 }
 
-// GetIndexInfo returns information about the index
-func (j *JSONAssetManager) GetIndexInfo() map[string]interface{} {
-	j.RLock()
-	defer j.RUnlock()
+// scanExistingAssets scans the JSON directory for existing assets and builds the column list and asset ID cache
+func (j *JSONAssetManager) scanExistingAssets() error {
+	j.logger.Info("Scanning existing assets in %s", j.jsonDir)
 	
-	// Count unique IDs and columns
-	idMap := make(map[string]bool)
+	// Start progress tracking
+	j.progress.StartProgress("Scanning existing assets", 0)
+	
+	// Use a map to track unique columns
 	colMap := make(map[string]bool)
+	assetCount := 0
 	
-	for _, entry := range j.index.Entries {
-		idMap[entry.ID] = true
-		colMap[entry.ColumnName] = true
+	// Walk the JSON directory recursively
+	err := filepath.Walk(j.jsonDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+		
+		// Only process JSON files
+		if !strings.HasSuffix(path, ".json") {
+			return nil
+		}
+		
+		// Skip metadata files
+		if strings.HasSuffix(path, ".metadata.json") {
+			return nil
+		}
+		
+		// Extract the ID from the filename
+		id := strings.TrimSuffix(filepath.Base(path), ".json")
+		
+		// Add to asset IDs cache
+		j.assetIDsMutex.Lock()
+		j.assetIDs[id] = true
+		j.assetIDsMutex.Unlock()
+		
+		// Load the metadata file
+		metadata, err := j.loadAssetMetadata(id)
+		if err != nil {
+			// If metadata doesn't exist, just skip
+			return nil
+		}
+		
+		// Add columns to the column map
+		for _, col := range metadata.Columns {
+			colMap[col.ColumnName] = true
+		}
+		
+		assetCount++
+		if assetCount % 100 == 0 {
+			j.progress.UpdateProgress(assetCount, fmt.Sprintf("Scanned %d assets", assetCount))
+		}
+		
+		return nil
+	})
+	
+	// Convert the column map to a slice
+	j.columnsMutex.Lock()
+	for col := range colMap {
+		j.columns = append(j.columns, col)
 	}
+	j.columnsMutex.Unlock()
+	
+	j.progress.CompleteProgress(fmt.Sprintf("Scanned %d assets with %d unique columns", assetCount, len(colMap)))
+	j.logger.Info("Scanned %d assets with %d unique columns", assetCount, len(colMap))
+	
+	return err
+}
+
+// getAssetMetadataPath returns the path to the metadata file for an asset
+func (j *JSONAssetManager) getAssetMetadataPath(id string) string {
+	// Get the directory path for the asset
+	dirPath := filepath.Dir(j.GetJSONFilePath(id))
+	
+	// Return the path to the metadata file
+	return filepath.Join(dirPath, id+".metadata.json")
+}
+
+// loadAssetMetadata loads the metadata for an asset
+func (j *JSONAssetManager) loadAssetMetadata(id string) (*AssetMetadata, error) {
+	metadataPath := j.getAssetMetadataPath(id)
+	
+	// Check if the file exists
+	if _, err := os.Stat(metadataPath); err != nil {
+		// Create a new metadata file if it doesn't exist
+		metadata := &AssetMetadata{
+			ID:        id,
+			Columns:   []ColumnIndex{},
+			UpdatedAt: time.Now(),
+		}
+		
+		// Save the new metadata file
+		if err := j.saveAssetMetadata(id, metadata); err != nil {
+			return nil, err
+		}
+		
+		return metadata, nil
+	}
+	
+	// Read the file
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return nil, fmt.Errorf("error reading metadata file for ID %s: %v", id, err)
+	}
+	
+	// Parse the JSON
+	metadata := &AssetMetadata{}
+	if err := json.Unmarshal(data, metadata); err != nil {
+		return nil, fmt.Errorf("error parsing metadata file for ID %s: %v", id, err)
+	}
+	
+	return metadata, nil
+}
+
+// saveAssetMetadata saves the metadata for an asset
+func (j *JSONAssetManager) saveAssetMetadata(id string, metadata *AssetMetadata) error {
+	metadataPath := j.getAssetMetadataPath(id)
+	
+	// Update the timestamp
+	metadata.UpdatedAt = time.Now()
+	
+	// Convert to JSON
+	data, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("error converting metadata to JSON for ID %s: %v", id, err)
+	}
+	
+	// Ensure the directory exists
+	dirPath := filepath.Dir(metadataPath)
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return fmt.Errorf("error creating directory for ID %s: %v", id, err)
+	}
+	
+	// Write to file
+	if err := os.WriteFile(metadataPath, data, 0644); err != nil {
+		return fmt.Errorf("error writing metadata file for ID %s: %v", id, err)
+	}
+	
+	return nil
+}
+
+// GetIndexInfo returns information about the assets and columns
+func (j *JSONAssetManager) GetIndexInfo() map[string]interface{} {
+	j.assetIDsMutex.RLock()
+	assetCount := len(j.assetIDs)
+	j.assetIDsMutex.RUnlock()
+	
+	j.columnsMutex.RLock()
+	columnCount := len(j.columns)
+	j.columnsMutex.RUnlock()
 	
 	return map[string]interface{}{
-		"total_entries":    len(j.index.Entries),
-		"unique_ids":       len(idMap),
-		"unique_columns":   len(colMap),
-		"index_file":       j.indexFilePath,
+		"asset_count":    assetCount,
+		"column_count":   columnCount,
+		"storage_type":   "distributed",
+		"storage_path":   j.jsonDir,
 	}
+}
+
+// GetAssetColumnMetadata returns all column metadata for a specific asset
+func (j *JSONAssetManager) GetAssetColumnMetadata(id string) (map[string]map[string]string, error) {
+	// Load the metadata for the asset
+	metadata, err := j.loadAssetMetadata(id)
+	if err != nil {
+		return nil, fmt.Errorf("error loading metadata for asset %s: %v", id, err)
+	}
+	
+	// Create a map of column name to metadata
+	result := make(map[string]map[string]string)
+	
+	// Add each column's metadata
+	for _, col := range metadata.Columns {
+		result[col.ColumnName] = map[string]string{
+			"effective_date": col.EffectiveDate,
+			"source_file":    col.SourceFile,
+		}
+	}
+	
+	return result, nil
 }
 
 // GetAsset loads an asset from its JSON file
