@@ -1,6 +1,6 @@
 # Data Matrix
 
-A Go service that loads CSV files into an in-memory DuckDB database and provides an HTTP API for querying the data using SQL.
+A Go service that loads CSV files into an in-memory DuckDB database and provides an HTTP API for querying the data using SQL. The service includes effective date tracking for column values and a full trie-based file structure for data persistence.
 
 ## Requirements
 - Go 1.24.2 or later
@@ -148,6 +148,48 @@ You can control which data gets loaded using two filtering mechanisms:
    ```
    This will include IDs starting with "BBG0", matching the pattern "US" followed by digits, or ending with "EQUITY".
 
+## Effective Date Tracking
+
+The application maintains an index of effective dates for each column value to ensure data freshness and prevent overwriting newer data with older data.
+
+### How Effective Date Tracking Works
+
+1. **Date Extraction**: When loading a CSV file, the system extracts a date in YYYYMMDD format from the filename.
+   - For example, from `financial_data_20250410.csv`, it extracts `20250410` as the effective date.
+   - If no date is found in the filename, the current date is used as a fallback.
+
+2. **Column-Level Tracking**: For each ID_BB_GLOBAL and column combination, the system tracks the effective date of the data.
+
+3. **Update Logic**: When new data is loaded:
+   - If a column doesn't exist yet for an ID, the value is added with the current file's effective date
+   - If a column already exists, the value is only updated if the new file's effective date is newer than the existing one
+
+4. **Persistence**: The effective date index is stored in `data/asset_index.json` and persists between application runs.
+
+### Benefits
+
+- Prevents older data from overwriting newer data
+- Allows loading files in any order without data quality concerns
+- Provides an audit trail of when data was last updated
+- Enables incremental updates without full reloads
+
+## Trie Directory Structure
+
+The application uses a full trie directory structure to store JSON asset files efficiently:
+
+### How the Trie Structure Works
+
+1. **Full Path Utilization**: Every character in the ID_BB_GLOBAL is used to create the directory path.
+   - For example, an ID like `BBG000B9XRY4` creates a directory structure: `json/b/b/g/0/0/0/b/9/x/r/y/4/BBG000B9XRY4.json`
+
+2. **Benefits**:
+   - Distributes files evenly across the filesystem
+   - Prevents directories from containing too many files
+   - Enables efficient lookups without scanning large directories
+   - Scales well to millions of unique IDs
+
+3. **Implementation**: The trie structure is automatically created when saving or accessing JSON files.
+
 ## How It Works
 
 The application:
@@ -156,8 +198,10 @@ The application:
    - An S3 bucket (when `S3_BUCKET` environment variable is set), downloading only the most recent file from each directory
 2. Skips files without an `ID_BB_GLOBAL` column
 3. Creates a wide table with one row per unique `ID_BB_GLOBAL` value
-4. Keeps all data in an in-memory DuckDB database for fast SQL querying
-5. Exposes a REST API for querying the data
+4. Maintains an index of column effective dates to ensure data freshness
+5. Stores data in JSON files using a full trie directory structure based on ID_BB_GLOBAL
+6. Keeps all data in an in-memory DuckDB database for fast SQL querying
+7. Exposes a REST API for querying the data
 
 ## API Endpoints
 
@@ -169,6 +213,19 @@ Response:
 {
   "columns": ["ID_BB_GLOBAL", "Company", "Industry", "Revenue", "Employees", "Founded", "Headquarters"],
   "count": 7
+}
+```
+
+### GET /api/index
+Returns information about the effective date index.
+
+Response:
+```json
+{
+  "total_entries": 1250,
+  "unique_ids": 150,
+  "unique_columns": 35,
+  "index_file": "data/asset_index.json"
 }
 ```
 
