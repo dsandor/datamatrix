@@ -233,13 +233,8 @@ func (j *JSONAssetManager) GetJSONFilePath(id string) string {
 	// Create the trie directory structure
 	var pathParts []string
 	
-	// Add each character as a directory level, up to 5 levels or the length of the ID
-	depth := 5
-	if len(idLower) < depth {
-		depth = len(idLower)
-	}
-	
-	for i := 0; i < depth; i++ {
+	// Use every character in the ID for the directory structure
+	for i := 0; i < len(idLower); i++ {
 		pathParts = append(pathParts, string(idLower[i]))
 	}
 	
