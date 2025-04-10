@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -399,19 +400,22 @@ func (j *JSONAssetManager) GetColumns() []string {
 }
 
 // LoadCSVFile loads a CSV file and updates the JSON assets
+// This method is designed to be called from multiple goroutines in parallel
 func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	fileName := filepath.Base(filePath)
 	j.logger.Info("Loading CSV file: %s", filePath)
 	
-	// Start progress tracking
-	j.progress.StartProgress(fmt.Sprintf("Loading %s", fileName), 0)
+	// Create a local progress tracker for this file to avoid lock contention
+	// when multiple goroutines are processing files simultaneously
+	fileProgress := NewProgressTracker(j.logger)
+	fileProgress.StartProgress(fmt.Sprintf("Loading %s", fileName), 0)
 	
 	// Extract the effective date from the filename
 	effectiveDate := j.getEffectiveDateFromFilename(filePath)
 	j.logger.Info("Effective date for file %s: %s", fileName, effectiveDate)
 	
 	// Update progress to show we're opening the file
-	j.progress.SetStatus(fmt.Sprintf("Opening file %s", fileName))
+	fileProgress.SetStatus(fmt.Sprintf("Opening file %s", fileName))
 	
 	// Open the file
 	file, err := os.Open(filePath)
@@ -436,7 +440,7 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	csvReader := csv.NewReader(reader)
 	
 	// Update progress to show we're reading the CSV header
-	j.progress.SetStatus(fmt.Sprintf("Reading header from %s", fileName))
+	fileProgress.SetStatus(fmt.Sprintf("Reading header from %s", fileName))
 	
 	// Read the header
 	header, err := csvReader.Read()
@@ -470,7 +474,7 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	updatedCount := 0
 	
 	// Update progress status
-	j.progress.SetStatus(fmt.Sprintf("Enumerating rows in %s", fileName))
+	fileProgress.SetStatus(fmt.Sprintf("Enumerating rows in %s", fileName))
 	
 	for {
 		record, err := csvReader.Read()
@@ -497,7 +501,7 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 		// Update progress with current row count
 		rowCount++
 		if rowCount % 10 == 0 { // Update every 10 rows to keep the progress tracker active
-			j.progress.UpdateProgress(rowCount, fmt.Sprintf("Enumerating %s: %d rows", fileName, rowCount))
+			fileProgress.UpdateProgress(rowCount, fmt.Sprintf("Enumerating %s: %d rows", fileName, rowCount))
 		}
 		
 		// Update the asset with the CSV data and track if updates were made
@@ -514,7 +518,7 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	}
 	
 	// Update progress to show we're saving the index
-	j.progress.SetStatus(fmt.Sprintf("Saving index after processing %s", fileName))
+	fileProgress.SetStatus(fmt.Sprintf("Saving index after processing %s", fileName))
 	
 	// Save the index after processing the file
 	if err := j.saveIndex(); err != nil {
@@ -522,7 +526,7 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	}
 	
 	// Complete progress tracking
-	j.progress.CompleteProgress(fmt.Sprintf("Completed processing %s", fileName))
+	fileProgress.CompleteProgress(fmt.Sprintf("Completed processing %s", fileName))
 	
 	j.logger.Success("Loaded %d rows from %s (updated %d, skipped %d rows)", 
 		rowCount, filepath.Base(filePath), updatedCount, skippedCount)
@@ -535,15 +539,67 @@ func (j *JSONAssetManager) LoadFiles(filePaths []string) error {
 	j.progress.StartProgress("Loading CSV files", len(filePaths))
 	j.logger.Info("Starting to process %d CSV files", len(filePaths))
 	
-	for i, filePath := range filePaths {
-		// Update overall progress with file name
-		fileName := filepath.Base(filePath)
-		j.progress.UpdateProgress(i+1, fmt.Sprintf("Processing file %d of %d: %s", i+1, len(filePaths), fileName))
-		if err := j.LoadCSVFile(filePath); err != nil {
-			j.logger.Error("Error loading file %s: %v", filePath, err)
-			// Continue with other files
-		}
+	if len(filePaths) == 0 {
+		j.logger.Info("No CSV files to process")
+		return nil
 	}
+	
+	// Create a worker pool for parallel processing
+	numWorkers := runtime.NumCPU() // Use number of CPU cores for worker count
+	if numWorkers > 8 {
+		numWorkers = 8 // Cap at 8 workers to avoid excessive resource usage
+	}
+	if numWorkers > len(filePaths) {
+		numWorkers = len(filePaths) // Don't create more workers than files
+	}
+	
+	j.logger.Info("Using %d worker goroutines for parallel file processing", numWorkers)
+	
+	// Create a channel for work items
+	jobs := make(chan string, len(filePaths))
+	
+	// Create a wait group to wait for all workers to finish
+	var wg sync.WaitGroup
+	
+	// Create a mutex for updating progress safely
+	progressMutex := &sync.Mutex{}
+	processedCount := 0
+	
+	// Create worker goroutines
+	for w := 1; w <= numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			
+			for filePath := range jobs {
+				fileName := filepath.Base(filePath)
+				j.logger.Info("Worker %d processing file: %s", workerID, fileName)
+				
+				// Process the file
+				if err := j.LoadCSVFile(filePath); err != nil {
+					j.logger.Error("Error loading file %s: %v", filePath, err)
+					// Continue with other files
+				}
+				
+				// Update progress safely
+				progressMutex.Lock()
+				processedCount++
+				j.progress.UpdateProgress(processedCount, fmt.Sprintf("Processed %d of %d files", processedCount, len(filePaths)))
+				progressMutex.Unlock()
+			}
+		}(w)
+	}
+	
+	// Send all files to the job channel
+	for _, filePath := range filePaths {
+		jobs <- filePath
+	}
+	
+	// Close the job channel to signal no more work
+	close(jobs)
+	
+	// Wait for all workers to finish
+	wg.Wait()
 	
 	// For compatibility with the existing code, we'll update the Data map
 	// with a placeholder entry. The actual data is stored in JSON files.
