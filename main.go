@@ -197,6 +197,21 @@ func (dm *DataMatrix) handleGetColumns(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// @Summary Get index information
+// @Description Returns information about the asset index including effective dates
+// @Tags index
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Router /api/index [get]
+func (dm *DataMatrix) handleGetIndexInfo(w http.ResponseWriter, r *http.Request) {
+	dm.RLock()
+	defer dm.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	indexInfo := dm.assetManager.GetIndexInfo()
+	json.NewEncoder(w).Encode(indexInfo)
+}
+
 // QueryRequest defines the structure for the query API request
 type QueryRequest struct {
 	// Optional list of columns to return. If empty or omitted, all columns will be returned (equivalent to SELECT *)
@@ -460,6 +475,7 @@ func main() {
 	
 	// API endpoints
 	r.HandleFunc("/api/columns", dm.handleGetColumns).Methods("GET")
+	r.HandleFunc("/api/index", dm.handleGetIndexInfo).Methods("GET")
 	r.HandleFunc("/api/query", dm.handleQuery).Methods("POST")
 	
 	// Serve Swagger UI at root
