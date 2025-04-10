@@ -10,35 +10,179 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 	"compress/gzip"
 )
+
+// ColumnIndex represents the effective date index for a column value
+type ColumnIndex struct {
+	ID           string `json:"id"`           // ID_BB_GLOBAL
+	ColumnName   string `json:"column_name"`  // Column/property name
+	EffectiveDate string `json:"effective_date"` // Effective date in YYYYMMDD format
+}
+
+// AssetIndex holds the index data for all assets
+type AssetIndex struct {
+	Entries []ColumnIndex `json:"entries"`
+}
 
 // JSONAssetManager manages the JSON files for BB_ASSETS
 // It implements the same interface as DataDictionary for compatibility
 type JSONAssetManager struct {
 	sync.RWMutex
 	logger         *Logger
+	progress       *ProgressTracker
 	jsonDir        string   // Directory for JSON files
 	columns        []string // List of all columns
 	idPrefixFilter []string // Optional ID_BB_GLOBAL prefix filter
 	// For compatibility with DataDictionary interface
 	Data map[string]map[string]string // This will be empty, just for interface compatibility
+	
+	// Index tracking
+	index         AssetIndex // Index of column effective dates
+	indexFilePath string     // Path to the index file
+	indexModified bool       // Flag to track if index was modified
 }
 
 // NewJSONAssetManager creates a new JSON asset manager
-func NewJSONAssetManager(logger *Logger, dataDir string) (*JSONAssetManager, error) {
+func NewJSONAssetManager(logger *Logger, progress *ProgressTracker, dataDir string) (*JSONAssetManager, error) {
 	// Create the JSON directory if it doesn't exist
 	jsonDir := filepath.Join(dataDir, "json")
 	if err := os.MkdirAll(jsonDir, 0755); err != nil {
 		return nil, fmt.Errorf("error creating JSON directory: %v", err)
 	}
+	
+	// Set up the index file path
+	indexFilePath := filepath.Join(dataDir, "asset_index.json")
+	
+	manager := &JSONAssetManager{
+		logger:        logger,
+		progress:      progress,
+		jsonDir:       jsonDir,
+		columns:       []string{},
+		Data:          make(map[string]map[string]string), // Empty map for interface compatibility
+		indexFilePath: indexFilePath,
+		indexModified: false,
+	}
+	
+	// Load the index file if it exists
+	if err := manager.loadIndex(); err != nil {
+		logger.Warn("Could not load index file: %v. Creating new index.", err)
+	}
+	
+	return manager, nil
+}
 
-	return &JSONAssetManager{
-		logger:  logger,
-		jsonDir: jsonDir,
-		columns: []string{},
-		Data:    make(map[string]map[string]string), // Empty map for interface compatibility
-	}, nil
+// loadIndex loads the index file if it exists
+func (j *JSONAssetManager) loadIndex() error {
+	j.Lock()
+	defer j.Unlock()
+	
+	// Check if the index file exists
+	if _, err := os.Stat(j.indexFilePath); os.IsNotExist(err) {
+		// Index file doesn't exist, initialize an empty index
+		j.index = AssetIndex{
+			Entries: []ColumnIndex{},
+		}
+		return nil
+	}
+	
+	// Read the index file
+	data, err := os.ReadFile(j.indexFilePath)
+	if err != nil {
+		return fmt.Errorf("error reading index file: %v", err)
+	}
+	
+	// Parse the JSON
+	if err := json.Unmarshal(data, &j.index); err != nil {
+		return fmt.Errorf("error parsing index file: %v", err)
+	}
+	
+	j.logger.Info("Loaded index file with %d entries", len(j.index.Entries))
+	return nil
+}
+
+// saveIndex saves the index to the index file
+func (j *JSONAssetManager) saveIndex() error {
+	j.Lock()
+	defer j.Unlock()
+	
+	// Only save if the index was modified
+	if !j.indexModified {
+		return nil
+	}
+	
+	// Convert to JSON
+	data, err := json.MarshalIndent(j.index, "", "  ")
+	if err != nil {
+		return fmt.Errorf("error converting index to JSON: %v", err)
+	}
+	
+	// Write to file
+	if err := os.WriteFile(j.indexFilePath, data, 0644); err != nil {
+		return fmt.Errorf("error writing index file: %v", err)
+	}
+	
+	j.indexModified = false
+	j.logger.Info("Saved index file with %d entries", len(j.index.Entries))
+	return nil
+}
+
+// getEffectiveDateFromFilename extracts the YYYYMMDD date from a filename
+func (j *JSONAssetManager) getEffectiveDateFromFilename(filename string) string {
+	// Extract date using regex - looking for 8 consecutive digits (YYYYMMDD)
+	re := regexp.MustCompile(`\d{8}`)
+	match := re.FindString(filename)
+	
+	if match != "" {
+		// Validate the date
+		if _, err := time.Parse("20060102", match); err == nil {
+			return match
+		}
+	}
+	
+	// If no valid date found, use today's date as fallback
+	return time.Now().Format("20060102")
+}
+
+// getColumnEffectiveDate gets the effective date for a column from the index
+func (j *JSONAssetManager) getColumnEffectiveDate(id, columnName string) string {
+	j.RLock()
+	defer j.RUnlock()
+	
+	for _, entry := range j.index.Entries {
+		if entry.ID == id && entry.ColumnName == columnName {
+			return entry.EffectiveDate
+		}
+	}
+	
+	return "" // No effective date found
+}
+
+// updateColumnEffectiveDate updates the effective date for a column in the index
+func (j *JSONAssetManager) updateColumnEffectiveDate(id, columnName, effectiveDate string) {
+	j.Lock()
+	defer j.Unlock()
+	
+	// Check if the entry already exists
+	for i, entry := range j.index.Entries {
+		if entry.ID == id && entry.ColumnName == columnName {
+			// Only update if the new date is newer
+			if effectiveDate > entry.EffectiveDate {
+				j.index.Entries[i].EffectiveDate = effectiveDate
+				j.indexModified = true
+			}
+			return
+		}
+	}
+	
+	// Entry doesn't exist, add it
+	j.index.Entries = append(j.index.Entries, ColumnIndex{
+		ID:           id,
+		ColumnName:   columnName,
+		EffectiveDate: effectiveDate,
+	})
+	j.indexModified = true
 }
 
 // SetIDPrefixFilter sets the ID_BB_GLOBAL prefix filter
@@ -91,13 +235,8 @@ func (j *JSONAssetManager) GetJSONFilePath(id string) string {
 	// Create the trie directory structure
 	var pathParts []string
 	
-	// Add each character as a directory level, up to 5 levels or the length of the ID
-	depth := 5
-	if len(idLower) < depth {
-		depth = len(idLower)
-	}
-	
-	for i := 0; i < depth; i++ {
+	// Use every character in the ID for the directory structure
+	for i := 0; i < len(idLower); i++ {
 		pathParts = append(pathParts, string(idLower[i]))
 	}
 	
@@ -170,17 +309,29 @@ func (j *JSONAssetManager) SaveAsset(id string, asset map[string]string) error {
 }
 
 // UpdateAssetFromCSV updates an asset with data from a CSV record
+// This is kept for backward compatibility
 func (j *JSONAssetManager) UpdateAssetFromCSV(id string, header []string, record []string) error {
+	// Use current date as effective date for backward compatibility
+	_, err := j.UpdateAssetFromCSVWithDate(id, header, record, time.Now().Format("20060102"))
+	return err
+}
+
+// UpdateAssetFromCSVWithDate updates an asset with data from a CSV record with effective date
+// Returns true if any values were updated, false otherwise
+func (j *JSONAssetManager) UpdateAssetFromCSVWithDate(id string, header []string, record []string, effectiveDate string) (bool, error) {
 	// Check if the ID should be included based on the prefix filter
 	if !j.ShouldIncludeID(id) {
-		return nil
+		return false, nil
 	}
 	
 	// Load or create the asset
 	asset, err := j.LoadOrCreateAsset(id)
 	if err != nil {
-		return fmt.Errorf("error loading asset for ID %s: %v", id, err)
+		return false, fmt.Errorf("error loading asset for ID %s: %v", id, err)
 	}
+	
+	// Track if any values were updated
+	updated := false
 	
 	// Update the asset with the new data
 	for i, value := range record {
@@ -192,11 +343,24 @@ func (j *JSONAssetManager) UpdateAssetFromCSV(id string, header []string, record
 				continue
 			}
 			
-			// Update the value
-			asset[colName] = value
+			// Check if we should update this column based on effective date
+			currentEffectiveDate := j.getColumnEffectiveDate(id, colName)
 			
-			// Add to columns list if not already present
-			j.addColumnIfNotExists(colName)
+			// Update if:
+			// 1. No effective date exists for this column (first time seeing it)
+			// 2. The new effective date is newer than the current one
+			if currentEffectiveDate == "" || effectiveDate > currentEffectiveDate {
+				// Update the value
+				asset[colName] = value
+				
+				// Update the effective date in the index
+				j.updateColumnEffectiveDate(id, colName, effectiveDate)
+				
+				updated = true
+				
+				// Add to columns list if not already present
+				j.addColumnIfNotExists(colName)
+			}
 		}
 	}
 	
@@ -206,8 +370,15 @@ func (j *JSONAssetManager) UpdateAssetFromCSV(id string, header []string, record
 	j.Data[id] = asset
 	j.Unlock()
 	
-	// Save the updated asset
-	return j.SaveAsset(id, asset)
+	// Only save if something was updated
+	if updated {
+		// Save the updated asset
+		if err := j.SaveAsset(id, asset); err != nil {
+			return false, err
+		}
+	}
+	
+	return updated, nil
 }
 
 // addColumnIfNotExists adds a column to the list if it doesn't already exist
@@ -229,7 +400,18 @@ func (j *JSONAssetManager) GetColumns() []string {
 
 // LoadCSVFile loads a CSV file and updates the JSON assets
 func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
+	fileName := filepath.Base(filePath)
 	j.logger.Info("Loading CSV file: %s", filePath)
+	
+	// Start progress tracking
+	j.progress.StartProgress(fmt.Sprintf("Loading %s", fileName), 0)
+	
+	// Extract the effective date from the filename
+	effectiveDate := j.getEffectiveDateFromFilename(filePath)
+	j.logger.Info("Effective date for file %s: %s", fileName, effectiveDate)
+	
+	// Update progress to show we're opening the file
+	j.progress.SetStatus(fmt.Sprintf("Opening file %s", fileName))
 	
 	// Open the file
 	file, err := os.Open(filePath)
@@ -252,6 +434,9 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	
 	// Create a CSV reader
 	csvReader := csv.NewReader(reader)
+	
+	// Update progress to show we're reading the CSV header
+	j.progress.SetStatus(fmt.Sprintf("Reading header from %s", fileName))
 	
 	// Read the header
 	header, err := csvReader.Read()
@@ -282,6 +467,11 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	// Read and process each row
 	rowCount := 0
 	skippedCount := 0
+	updatedCount := 0
+	
+	// Update progress status
+	j.progress.SetStatus(fmt.Sprintf("Enumerating rows in %s", fileName))
+	
 	for {
 		record, err := csvReader.Read()
 		if err == io.EOF {
@@ -304,23 +494,51 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 			continue
 		}
 		
-		// Update the asset with the CSV data
-		if err := j.UpdateAssetFromCSV(id, header, record); err != nil {
+		// Update progress with current row count
+		rowCount++
+		if rowCount % 10 == 0 { // Update every 10 rows to keep the progress tracker active
+			j.progress.UpdateProgress(rowCount, fmt.Sprintf("Enumerating %s: %d rows", fileName, rowCount))
+		}
+		
+		// Update the asset with the CSV data and track if updates were made
+		updated, err := j.UpdateAssetFromCSVWithDate(id, header, record, effectiveDate)
+		if err != nil {
 			j.logger.Warn("Error updating asset for ID %s: %v", id, err)
 			skippedCount++
 			continue
 		}
 		
-		rowCount++
+		if updated {
+			updatedCount++
+		}
 	}
 	
-	j.logger.Success("Loaded %d rows from %s (skipped %d rows)", rowCount, filepath.Base(filePath), skippedCount)
+	// Update progress to show we're saving the index
+	j.progress.SetStatus(fmt.Sprintf("Saving index after processing %s", fileName))
+	
+	// Save the index after processing the file
+	if err := j.saveIndex(); err != nil {
+		j.logger.Warn("Error saving index file: %v", err)
+	}
+	
+	// Complete progress tracking
+	j.progress.CompleteProgress(fmt.Sprintf("Completed processing %s", fileName))
+	
+	j.logger.Success("Loaded %d rows from %s (updated %d, skipped %d rows)", 
+		rowCount, filepath.Base(filePath), updatedCount, skippedCount)
 	return nil
 }
 
 // LoadFiles loads multiple CSV files and updates the JSON assets
 func (j *JSONAssetManager) LoadFiles(filePaths []string) error {
-	for _, filePath := range filePaths {
+	// Start progress tracking for overall file loading
+	j.progress.StartProgress("Loading CSV files", len(filePaths))
+	j.logger.Info("Starting to process %d CSV files", len(filePaths))
+	
+	for i, filePath := range filePaths {
+		// Update overall progress with file name
+		fileName := filepath.Base(filePath)
+		j.progress.UpdateProgress(i+1, fmt.Sprintf("Processing file %d of %d: %s", i+1, len(filePaths), fileName))
 		if err := j.LoadCSVFile(filePath); err != nil {
 			j.logger.Error("Error loading file %s: %v", filePath, err)
 			// Continue with other files
@@ -333,8 +551,45 @@ func (j *JSONAssetManager) LoadFiles(filePaths []string) error {
 	j.Data["placeholder"] = map[string]string{"ID_BB_GLOBAL": "placeholder"}
 	j.Unlock()
 	
-	j.logger.Success("Processed all files, total columns: %d", len(j.columns))
+	// Update progress to show we're saving the final index
+	j.progress.SetStatus("Saving final index after processing all files")
+	
+	// Make sure the index is saved after loading all files
+	if err := j.saveIndex(); err != nil {
+		j.logger.Warn("Error saving index file: %v", err)
+	}
+	
+	// Complete overall progress tracking
+	j.progress.CompleteProgress("All CSV files processed successfully")
+	
+	// Set system to idle state
+	j.progress.SetStatus("Idle - Ready for queries")
+	
+	j.logger.Success("Processed all files, total columns: %d, index entries: %d", 
+		len(j.columns), len(j.index.Entries))
 	return nil
+}
+
+// GetIndexInfo returns information about the index
+func (j *JSONAssetManager) GetIndexInfo() map[string]interface{} {
+	j.RLock()
+	defer j.RUnlock()
+	
+	// Count unique IDs and columns
+	idMap := make(map[string]bool)
+	colMap := make(map[string]bool)
+	
+	for _, entry := range j.index.Entries {
+		idMap[entry.ID] = true
+		colMap[entry.ColumnName] = true
+	}
+	
+	return map[string]interface{}{
+		"total_entries":    len(j.index.Entries),
+		"unique_ids":       len(idMap),
+		"unique_columns":   len(colMap),
+		"index_file":       j.indexFilePath,
+	}
 }
 
 // GetAsset loads an asset from its JSON file

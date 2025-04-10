@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/mux"
 	httpSwagger "github.com/swaggo/http-swagger"
@@ -19,6 +20,7 @@ type DataMatrix struct {
 	sync.RWMutex
 	assetManager   *JSONAssetManager
 	logger         *Logger
+	progress       *ProgressTracker
 	s3Bucket       string   // S3 bucket name (optional)
 	s3Prefix       string   // S3 prefix/path within the bucket (optional)
 	dataDir        string   // Local directory for downloaded S3 files
@@ -41,6 +43,9 @@ func NewDataMatrix(config *DataMatrixConfig) (*DataMatrix, error) {
 	logger := NewLogger()
 	logger.Info("Initializing DataMatrix...")
 
+	// Create a progress tracker
+	progress := NewProgressTracker(logger)
+	
 	// Log initial memory usage
 	logger.Memory("Initial memory usage: %s", GetMemoryUsageSummary())
 
@@ -51,7 +56,7 @@ func NewDataMatrix(config *DataMatrixConfig) (*DataMatrix, error) {
 	}
 	
 	// Create a new JSON asset manager
-	assetManager, err := NewJSONAssetManager(logger, dataDir)
+	assetManager, err := NewJSONAssetManager(logger, progress, dataDir)
 	if err != nil {
 		logger.Error("Error creating JSON asset manager: %v", err)
 		return nil, err
@@ -65,6 +70,7 @@ func NewDataMatrix(config *DataMatrixConfig) (*DataMatrix, error) {
 	dm := &DataMatrix{
 		assetManager:   assetManager,
 		logger:         logger,
+		progress:       progress,
 		s3Bucket:       config.S3Bucket,
 		s3Prefix:       config.S3Prefix,
 		dataDir:        dataDir,
@@ -130,7 +136,7 @@ func (dm *DataMatrix) loadData() error {
 		}
 		
 		// Try to load from S3
-		s3Files, s3Err := CopyS3FilesToLocal(dm.logger, dm.s3Bucket, dm.s3Prefix, dm.dataDir, dm.dirWhitelist, dm.idPrefixFilter)
+		s3Files, s3Err := CopyS3FilesToLocal(dm.logger, dm.progress, dm.s3Bucket, dm.s3Prefix, dm.dataDir, dm.dirWhitelist, dm.idPrefixFilter)
 		if s3Err == nil {
 			// S3 loading succeeded
 			csvFiles = s3Files
@@ -195,6 +201,59 @@ func (dm *DataMatrix) handleGetColumns(w http.ResponseWriter, r *http.Request) {
 		"columns": columns,
 		"count":   len(columns),
 	})
+}
+
+// @Summary Get index information
+// @Description Returns information about the asset index including effective dates
+// @Tags index
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Router /api/index [get]
+func (dm *DataMatrix) handleGetIndexInfo(w http.ResponseWriter, r *http.Request) {
+	dm.RLock()
+	defer dm.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	indexInfo := dm.assetManager.GetIndexInfo()
+	json.NewEncoder(w).Encode(indexInfo)
+}
+
+// @Summary Get progress information
+// @Description Returns the current progress status of file processing, row enumeration, and idle status
+// @Tags progress
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Router /api/progress [get]
+func (dm *DataMatrix) handleGetProgress(w http.ResponseWriter, r *http.Request) {
+	dm.RLock()
+	defer dm.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	
+	// Get the progress tracker's current status
+	progressStr := dm.progress.GetProgressString()
+	
+	// Get additional progress information
+	dm.progress.RLock()
+	response := map[string]interface{}{
+		"status": dm.progress.status,
+		"current": dm.progress.current,
+		"total": dm.progress.total,
+		"percentage": dm.progress.percentage,
+		"progress_bar": dm.progress.progressBar,
+		"is_idle": dm.progress.isIdle,
+		"display_string": progressStr,
+	}
+	
+	// Add idle time if the system is idle
+	if dm.progress.isIdle {
+		idleTime := time.Since(dm.progress.idleStartTime).Seconds()
+		response["idle_time_seconds"] = idleTime
+		response["idle_time_formatted"] = time.Since(dm.progress.idleStartTime).Round(time.Second).String()
+	}
+	dm.progress.RUnlock()
+	
+	json.NewEncoder(w).Encode(response)
 }
 
 // QueryRequest defines the structure for the query API request
@@ -460,7 +519,9 @@ func main() {
 	
 	// API endpoints
 	r.HandleFunc("/api/columns", dm.handleGetColumns).Methods("GET")
+	r.HandleFunc("/api/index", dm.handleGetIndexInfo).Methods("GET")
 	r.HandleFunc("/api/query", dm.handleQuery).Methods("POST")
+	r.HandleFunc("/api/progress", dm.handleGetProgress).Methods("GET")
 	
 	// Serve Swagger UI at root
 	r.PathPrefix("/swagger/").Handler(httpSwagger.WrapHandler)
