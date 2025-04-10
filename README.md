@@ -69,6 +69,23 @@ export DIR_WHITELIST="equity,^bond/.*,fx$"
 export ID_PREFIX_FILTER="BBG00,^US\d+,.*EQUITY$"
 ```
 
+#### Command Line Arguments
+
+The application supports the following command line arguments:
+
+```bash
+# To skip both downloading and processing files (use existing data on disk)
+go run main.go --skip-loading
+
+# To skip downloading from S3 but still process local files
+go run main.go --skip-downloading
+```
+
+These arguments are useful when:
+- You want to quickly start the server without reloading all data (faster startup)
+- You want to query existing assets directly from disk without refreshing the data
+- You've already processed a large dataset and just want to serve it via the API
+
 #### Starting the Server
 
 After configuring with either method, start the server:
@@ -321,6 +338,65 @@ Response:
   ],
   "count": 2,
   "total": 6
+}
+```
+
+### GET /api/asset/{id}
+Returns the full JSON object for a specific asset by its ID_BB_GLOBAL.
+
+Parameters:
+- `id` (path): The ID_BB_GLOBAL of the asset to retrieve
+
+Response:
+```json
+{
+  "ID_BB_GLOBAL": "BBG000B9XRY4",
+  "Company": "Apple Inc.",
+  "Revenue": "365.8",
+  "Industry": "Technology",
+  "MarketCap": "2.5T"
+}
+```
+
+### GET /api/asset/{id}/columns
+Returns metadata about the columns for a specific asset, including effective dates and source files.
+
+Parameters:
+- `id` (path): The ID_BB_GLOBAL of the asset to retrieve column metadata for
+
+Response:
+```json
+{
+  "Company": {
+    "effective_date": "20250410",
+    "source_file": "financial_data_20250410.csv"
+  },
+  "Revenue": {
+    "effective_date": "20250410",
+    "source_file": "financial_data_20250410.csv"
+  },
+  "Industry": {
+    "effective_date": "20250408",
+    "source_file": "industry_data_20250408.csv"
+  }
+}
+```
+
+### GET /api/asset/{id}/select
+Returns only the specified columns from an asset.
+
+Parameters:
+- `id` (path): The ID_BB_GLOBAL of the asset to retrieve
+- `columns` (query): Comma-separated list of column names to return
+
+Example: `/api/asset/BBG000B9XRY4/select?columns=Company,Revenue`
+
+Response:
+```json
+{
+  "ID_BB_GLOBAL": "BBG000B9XRY4",
+  "Company": "Apple Inc.",
+  "Revenue": "365.8"
 }
 ```
 

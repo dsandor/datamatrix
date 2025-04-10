@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -26,6 +27,7 @@ type DataMatrix struct {
 	dataDir        string   // Local directory for downloaded S3 files
 	dirWhitelist   []string // Optional whitelist of directory names
 	idPrefixFilter []string // Optional ID_BB_GLOBAL prefix filter
+	skipFileLoading bool    // Flag to skip file loading and downloading
 }
 
 // DataMatrixConfig holds configuration for DataMatrix initialization
@@ -35,6 +37,7 @@ type DataMatrixConfig struct {
 	DataDir        string   `json:"data_dir,omitempty"`        // Directory for downloaded S3 files (default: "data")
 	DirWhitelist   []string `json:"dir_whitelist,omitempty"`   // Optional whitelist of directory names
 	IDPrefixFilter []string `json:"id_prefix_filter,omitempty"` // Optional ID_BB_GLOBAL prefix filter
+	SkipFileLoading bool     `json:"skip_file_loading,omitempty"` // Flag to skip file loading and downloading
 	ConfigFile     string   `json:"-"`                         // Path to the configuration file (not stored in JSON)
 }
 
@@ -76,11 +79,18 @@ func NewDataMatrix(config *DataMatrixConfig) (*DataMatrix, error) {
 		dataDir:        dataDir,
 		dirWhitelist:   config.DirWhitelist,
 		idPrefixFilter: config.IDPrefixFilter,
+		skipFileLoading: config.SkipFileLoading,
 	}
 
-	if err := dm.loadData(); err != nil {
-		logger.Error("Error loading data: %v", err)
-		return nil, err
+	// Only load data if not skipping file loading
+	if !dm.skipFileLoading {
+		if err := dm.loadData(); err != nil {
+			logger.Error("Error loading data: %v", err)
+			return nil, err
+		}
+	} else {
+		logger.Info("Skipping file loading and downloading as requested")
+		logger.Info("Will serve API using existing data from disk")
 	}
 
 	// Log memory usage after loading data
@@ -127,8 +137,8 @@ func (dm *DataMatrix) loadData() error {
 	var csvFiles []string
 	var err error
 
-	// Check if we should load from S3
-	if dm.s3Bucket != "" {
+	// Check if we should load from S3 and if we're not skipping downloading
+	if dm.s3Bucket != "" && !dm.skipFileLoading {
 		if dm.s3Prefix != "" {
 			dm.logger.Info("Loading data from S3 bucket: %s with prefix: %s", dm.s3Bucket, dm.s3Prefix)
 		} else {
@@ -151,7 +161,7 @@ func (dm *DataMatrix) loadData() error {
 			dm.logger.Warn("Error loading data from S3: %v", s3Err)
 			dm.logger.Warn("Falling back to local data loading...")
 		}
-	} else {
+	} else if !dm.skipFileLoading {
 		// Load from local filesystem
 		dm.logger.Info("Searching for CSV files in example-data directory and subdirectories (up to 2 levels deep)...")
 		csvFiles, err = findCSVFiles("example-data", 0, 2, dm.logger)
@@ -163,6 +173,21 @@ func (dm *DataMatrix) loadData() error {
 		dm.logger.Success("Found %d CSV files in example-data directory and subdirectories (up to 2 levels deep)", len(csvFiles))
 	}
 
+	// If we're skipping file loading, just scan existing assets
+	if dm.skipFileLoading {
+		dm.logger.Info("Skipping file loading, scanning existing assets on disk...")
+		
+		// Ensure the asset manager scans existing assets
+		if err := dm.assetManager.scanExistingAssets(); err != nil {
+			dm.logger.Warn("Error scanning existing assets: %v", err)
+			return fmt.Errorf("error scanning existing assets: %v", err)
+		}
+		
+		dm.logger.Success("Successfully loaded existing assets from disk with %d columns", 
+			len(dm.assetManager.GetColumns()))
+		return nil
+	}
+	
 	// Load the CSV files into our JSON asset store
 	dm.logger.Info("Loading CSV files into JSON asset store...")
 	
@@ -254,6 +279,156 @@ func (dm *DataMatrix) handleGetProgress(w http.ResponseWriter, r *http.Request) 
 	dm.progress.RUnlock()
 	
 	json.NewEncoder(w).Encode(response)
+}
+
+// @Summary Get asset by ID_BB_GLOBAL
+// @Description Returns the full JSON object for a specific asset
+// @Tags asset
+// @Produce json
+// @Param id path string true "ID_BB_GLOBAL of the asset"
+// @Success 200 {object} map[string]string
+// @Failure 404 {string} string "Asset not found"
+// @Failure 500 {string} string "Internal server error"
+// @Router /api/asset/{id} [get]
+func (dm *DataMatrix) handleGetAsset(w http.ResponseWriter, r *http.Request) {
+	dm.RLock()
+	defer dm.RUnlock()
+	
+	// Get the asset ID from the URL parameters
+	vars := mux.Vars(r)
+	id := vars["id"]
+	
+	// Get the asset from the asset manager
+	asset, err := dm.assetManager.GetAsset(id)
+	if err != nil {
+		// Check if the error is because the asset doesn't exist
+		if os.IsNotExist(err) {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, "Asset with ID %s not found", id)
+			return
+		}
+		
+		// Otherwise, it's an internal server error
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Error retrieving asset: %v", err)
+		return
+	}
+	
+	// Return the asset as JSON
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(asset)
+}
+
+// @Summary Get asset columns
+// @Description Returns the columns and their metadata for a specific asset
+// @Tags asset
+// @Produce json
+// @Param id path string true "ID_BB_GLOBAL of the asset"
+// @Success 200 {object} map[string]map[string]string
+// @Failure 404 {string} string "Asset not found"
+// @Failure 500 {string} string "Internal server error"
+// @Router /api/asset/{id}/columns [get]
+func (dm *DataMatrix) handleGetAssetColumns(w http.ResponseWriter, r *http.Request) {
+	dm.RLock()
+	defer dm.RUnlock()
+	
+	// Get the asset ID from the URL parameters
+	vars := mux.Vars(r)
+	id := vars["id"]
+	
+	// Check if the asset exists
+	_, err := dm.assetManager.GetAsset(id)
+	if err != nil {
+		// Check if the error is because the asset doesn't exist
+		if os.IsNotExist(err) {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, "Asset with ID %s not found", id)
+			return
+		}
+		
+		// Otherwise, it's an internal server error
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Error checking asset existence: %v", err)
+		return
+	}
+	
+	// Get the column metadata for the asset
+	columnMetadata, err := dm.assetManager.GetAssetColumnMetadata(id)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Error retrieving column metadata: %v", err)
+		return
+	}
+	
+	// Return the column metadata as JSON
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(columnMetadata)
+}
+
+// @Summary Get specific columns from an asset
+// @Description Returns only the specified columns from an asset
+// @Tags asset
+// @Produce json
+// @Param id path string true "ID_BB_GLOBAL of the asset"
+// @Param columns query string false "Comma-separated list of column names to return"
+// @Success 200 {object} map[string]string
+// @Failure 404 {string} string "Asset not found"
+// @Failure 500 {string} string "Internal server error"
+// @Router /api/asset/{id}/select [get]
+func (dm *DataMatrix) handleGetAssetSelect(w http.ResponseWriter, r *http.Request) {
+	dm.RLock()
+	defer dm.RUnlock()
+	
+	// Get the asset ID from the URL parameters
+	vars := mux.Vars(r)
+	id := vars["id"]
+	
+	// Get the columns parameter from the query string
+	columnsParam := r.URL.Query().Get("columns")
+	
+	// Get the asset from the asset manager
+	asset, err := dm.assetManager.GetAsset(id)
+	if err != nil {
+		// Check if the error is because the asset doesn't exist
+		if os.IsNotExist(err) {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, "Asset with ID %s not found", id)
+			return
+		}
+		
+		// Otherwise, it's an internal server error
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Error retrieving asset: %v", err)
+		return
+	}
+	
+	// If no columns parameter is provided, return the full asset
+	if columnsParam == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(asset)
+		return
+	}
+	
+	// Split the columns parameter by comma
+	columns := strings.Split(columnsParam, ",")
+	
+	// Create a new map with only the requested columns
+	result := make(map[string]string)
+	
+	// Always include the ID_BB_GLOBAL column
+	result["ID_BB_GLOBAL"] = asset["ID_BB_GLOBAL"]
+	
+	// Add the requested columns if they exist in the asset
+	for _, col := range columns {
+		col = strings.TrimSpace(col)
+		if val, ok := asset[col]; ok {
+			result[col] = val
+		}
+	}
+	
+	// Return the filtered asset as JSON
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }
 
 // QueryRequest defines the structure for the query API request
@@ -420,11 +595,24 @@ func loadConfigFromFile(filePath string, logger *Logger) (*DataMatrixConfig, err
 }
 
 func main() {
+	// Parse command line flags
+	skipFileLoading := flag.Bool("skip-loading", false, "Skip file loading and downloading, serve API using existing data on disk")
+	skipDownloading := flag.Bool("skip-downloading", false, "Skip downloading files from S3, but still process local files")
+	flag.Parse()
+	
 	// Create a logger for the main function
 	logger := NewLogger()
 	
+	// Log command line flags
+	if *skipFileLoading {
+		logger.Info("Running with --skip-loading flag: Will skip file loading and downloading")
+	}
+	if *skipDownloading {
+		logger.Info("Running with --skip-downloading flag: Will skip downloading files from S3")
+	}
+	
 	// Check if example-data directory exists, if not create test data
-	if _, err := os.Stat("example-data"); os.IsNotExist(err) {
+	if _, err := os.Stat("example-data"); os.IsNotExist(err) && !*skipFileLoading {
 		logger.Info("Creating test data...")
 		if err := createTestData(); err != nil {
 			logger.Error("Error creating test data: %v", err)
@@ -462,6 +650,17 @@ func main() {
 			// No config file, use environment variables
 			logger.Info("No configuration file found, using environment variables")
 			config = &DataMatrixConfig{}
+			
+			// Apply command line flags to config
+			config.SkipFileLoading = *skipFileLoading
+			
+			// Handle skip-downloading flag - if we're skipping downloading but not skipping loading,
+			// we'll still process local files
+			if *skipDownloading && !*skipFileLoading {
+				// Clear S3 bucket to prevent S3 loading
+				config.S3Bucket = ""
+				logger.Info("Skipping S3 downloading, will process local files only")
+			}
 			
 			// Check if S3 bucket is specified as an environment variable
 			s3Path := os.Getenv("S3_BUCKET")
@@ -522,6 +721,9 @@ func main() {
 	r.HandleFunc("/api/index", dm.handleGetIndexInfo).Methods("GET")
 	r.HandleFunc("/api/query", dm.handleQuery).Methods("POST")
 	r.HandleFunc("/api/progress", dm.handleGetProgress).Methods("GET")
+	r.HandleFunc("/api/asset/{id}", dm.handleGetAsset).Methods("GET")
+	r.HandleFunc("/api/asset/{id}/columns", dm.handleGetAssetColumns).Methods("GET")
+	r.HandleFunc("/api/asset/{id}/select", dm.handleGetAssetSelect).Methods("GET")
 	
 	// Serve Swagger UI at root
 	r.PathPrefix("/swagger/").Handler(httpSwagger.WrapHandler)
