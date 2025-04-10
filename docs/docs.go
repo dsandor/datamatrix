@@ -15,6 +15,194 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
+        "/api/asset/{id}": {
+            "get": {
+                "description": "Returns the full JSON object for a specific asset",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "asset"
+                ],
+                "summary": "Get asset by ID_BB_GLOBAL",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "ID_BB_GLOBAL of the asset",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Asset not found",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/asset/{id}/columns": {
+            "get": {
+                "description": "Returns the columns and their metadata for a specific asset",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "asset"
+                ],
+                "summary": "Get asset columns",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "ID_BB_GLOBAL of the asset",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Asset not found",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/asset/{id}/select": {
+            "get": {
+                "description": "Returns only the specified columns from an asset",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "asset"
+                ],
+                "summary": "Get specific columns from an asset",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "ID_BB_GLOBAL of the asset",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Comma-separated list of column names to return",
+                        "name": "columns",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Asset not found",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/bulk-query": {
+            "post": {
+                "description": "Retrieve multiple assets by their ID_BB_GLOBAL identifiers with optional column filtering",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "query"
+                ],
+                "summary": "Bulk query assets by ID_BB_GLOBAL",
+                "parameters": [
+                    {
+                        "description": "Bulk query parameters",
+                        "name": "query",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/main.BulkQueryRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid request body",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Query error",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
         "/api/columns": {
             "get": {
                 "description": "Returns the list of all columns available in the data_matrix table",
@@ -25,6 +213,48 @@ const docTemplate = `{
                     "columns"
                 ],
                 "summary": "Get all available columns",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/api/index": {
+            "get": {
+                "description": "Returns information about the asset index including effective dates",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "index"
+                ],
+                "summary": "Get index information",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/api/progress": {
+            "get": {
+                "description": "Returns the current progress status of file processing, row enumeration, and idle status",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "progress"
+                ],
+                "summary": "Get progress information",
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -84,6 +314,34 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "main.BulkQueryRequest": {
+            "type": "object",
+            "properties": {
+                "columns": {
+                    "description": "Optional list of columns to return. If empty or omitted, all columns will be returned\nTo select all columns, you can either: 1) omit this field, 2) provide an empty array, or 3) use [\"*\"]",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "[\"ID_BB_GLOBAL\"",
+                        "\"Company\"",
+                        "\"Revenue\"]"
+                    ]
+                },
+                "ids": {
+                    "description": "List of ID_BB_GLOBAL identifiers to retrieve",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "[\"BBG000B9XRY4\"",
+                        "\"BBG000BVPV84\"]"
+                    ]
+                }
+            }
+        },
         "main.QueryRequest": {
             "type": "object",
             "properties": {
@@ -147,7 +405,7 @@ var SwaggerInfo = &swag.Spec{
 	BasePath:         "/",
 	Schemes:          []string{},
 	Title:            "DataMatrix API",
-	Description:      "A Go service that loads CSV files into an in-memory DuckDB database and provides an HTTP API for querying the data using SQL.",
+	Description:      "A Go service that loads CSV files into a JSON-based file store and provides an HTTP API for querying the data using a minimal SQL dialect.",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",

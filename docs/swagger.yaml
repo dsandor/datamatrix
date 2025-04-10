@@ -1,5 +1,27 @@
 basePath: /
 definitions:
+  main.BulkQueryRequest:
+    properties:
+      columns:
+        description: |-
+          Optional list of columns to return. If empty or omitted, all columns will be returned
+          To select all columns, you can either: 1) omit this field, 2) provide an empty array, or 3) use ["*"]
+        example:
+        - '["ID_BB_GLOBAL"'
+        - '"Company"'
+        - '"Revenue"]'
+        items:
+          type: string
+        type: array
+      ids:
+        description: List of ID_BB_GLOBAL identifiers to retrieve
+        example:
+        - '["BBG000B9XRY4"'
+        - '"BBG000BVPV84"]'
+        items:
+          type: string
+        type: array
+    type: object
   main.QueryRequest:
     properties:
       columns:
@@ -46,11 +68,136 @@ definitions:
 host: localhost:8080
 info:
   contact: {}
-  description: A Go service that loads CSV files into an in-memory DuckDB database
-    and provides an HTTP API for querying the data using SQL.
+  description: A Go service that loads CSV files into a JSON-based file store and
+    provides an HTTP API for querying the data using a minimal SQL dialect.
   title: DataMatrix API
   version: "1.0"
 paths:
+  /api/asset/{id}:
+    get:
+      description: Returns the full JSON object for a specific asset
+      parameters:
+      - description: ID_BB_GLOBAL of the asset
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Asset not found
+          schema:
+            type: string
+        "500":
+          description: Internal server error
+          schema:
+            type: string
+      summary: Get asset by ID_BB_GLOBAL
+      tags:
+      - asset
+  /api/asset/{id}/columns:
+    get:
+      description: Returns the columns and their metadata for a specific asset
+      parameters:
+      - description: ID_BB_GLOBAL of the asset
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              additionalProperties:
+                type: string
+              type: object
+            type: object
+        "404":
+          description: Asset not found
+          schema:
+            type: string
+        "500":
+          description: Internal server error
+          schema:
+            type: string
+      summary: Get asset columns
+      tags:
+      - asset
+  /api/asset/{id}/select:
+    get:
+      description: Returns only the specified columns from an asset
+      parameters:
+      - description: ID_BB_GLOBAL of the asset
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Comma-separated list of column names to return
+        in: query
+        name: columns
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Asset not found
+          schema:
+            type: string
+        "500":
+          description: Internal server error
+          schema:
+            type: string
+      summary: Get specific columns from an asset
+      tags:
+      - asset
+  /api/bulk-query:
+    post:
+      consumes:
+      - application/json
+      description: Retrieve multiple assets by their ID_BB_GLOBAL identifiers with
+        optional column filtering
+      parameters:
+      - description: Bulk query parameters
+        in: body
+        name: query
+        required: true
+        schema:
+          $ref: '#/definitions/main.BulkQueryRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Invalid request body
+          schema:
+            type: string
+        "500":
+          description: Query error
+          schema:
+            type: string
+      summary: Bulk query assets by ID_BB_GLOBAL
+      tags:
+      - query
   /api/columns:
     get:
       description: Returns the list of all columns available in the data_matrix table
@@ -65,6 +212,35 @@ paths:
       summary: Get all available columns
       tags:
       - columns
+  /api/index:
+    get:
+      description: Returns information about the asset index including effective dates
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get index information
+      tags:
+      - index
+  /api/progress:
+    get:
+      description: Returns the current progress status of file processing, row enumeration,
+        and idle status
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get progress information
+      tags:
+      - progress
   /api/query:
     post:
       consumes:
