@@ -400,14 +400,18 @@ func (j *JSONAssetManager) GetColumns() []string {
 
 // LoadCSVFile loads a CSV file and updates the JSON assets
 func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
+	fileName := filepath.Base(filePath)
 	j.logger.Info("Loading CSV file: %s", filePath)
 	
 	// Start progress tracking
-	j.progress.StartProgress(fmt.Sprintf("Loading %s", filepath.Base(filePath)), 0)
+	j.progress.StartProgress(fmt.Sprintf("Loading %s", fileName), 0)
 	
 	// Extract the effective date from the filename
 	effectiveDate := j.getEffectiveDateFromFilename(filePath)
-	j.logger.Info("Effective date for file %s: %s", filepath.Base(filePath), effectiveDate)
+	j.logger.Info("Effective date for file %s: %s", fileName, effectiveDate)
+	
+	// Update progress to show we're opening the file
+	j.progress.SetStatus(fmt.Sprintf("Opening file %s", fileName))
 	
 	// Open the file
 	file, err := os.Open(filePath)
@@ -430,6 +434,9 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	
 	// Create a CSV reader
 	csvReader := csv.NewReader(reader)
+	
+	// Update progress to show we're reading the CSV header
+	j.progress.SetStatus(fmt.Sprintf("Reading header from %s", fileName))
 	
 	// Read the header
 	header, err := csvReader.Read()
@@ -463,7 +470,7 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	updatedCount := 0
 	
 	// Update progress status
-	j.progress.SetStatus(fmt.Sprintf("Processing rows in %s", filepath.Base(filePath)))
+	j.progress.SetStatus(fmt.Sprintf("Enumerating rows in %s", fileName))
 	
 	for {
 		record, err := csvReader.Read()
@@ -489,8 +496,8 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 		
 		// Update progress with current row count
 		rowCount++
-		if rowCount % 100 == 0 { // Update every 100 rows to avoid excessive logging
-			j.progress.UpdateProgress(rowCount, fmt.Sprintf("Processed %d rows", rowCount))
+		if rowCount % 10 == 0 { // Update every 10 rows to keep the progress tracker active
+			j.progress.UpdateProgress(rowCount, fmt.Sprintf("Enumerating %s: %d rows", fileName, rowCount))
 		}
 		
 		// Update the asset with the CSV data and track if updates were made
@@ -504,9 +511,10 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 		if updated {
 			updatedCount++
 		}
-		
-		rowCount++
 	}
+	
+	// Update progress to show we're saving the index
+	j.progress.SetStatus(fmt.Sprintf("Saving index after processing %s", fileName))
 	
 	// Save the index after processing the file
 	if err := j.saveIndex(); err != nil {
@@ -514,7 +522,7 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 	}
 	
 	// Complete progress tracking
-	j.progress.CompleteProgress()
+	j.progress.CompleteProgress(fmt.Sprintf("Completed processing %s", fileName))
 	
 	j.logger.Success("Loaded %d rows from %s (updated %d, skipped %d rows)", 
 		rowCount, filepath.Base(filePath), updatedCount, skippedCount)
@@ -525,10 +533,12 @@ func (j *JSONAssetManager) LoadCSVFile(filePath string) error {
 func (j *JSONAssetManager) LoadFiles(filePaths []string) error {
 	// Start progress tracking for overall file loading
 	j.progress.StartProgress("Loading CSV files", len(filePaths))
+	j.logger.Info("Starting to process %d CSV files", len(filePaths))
 	
 	for i, filePath := range filePaths {
-		// Update overall progress
-		j.progress.UpdateProgress(i+1, fmt.Sprintf("File %d of %d", i+1, len(filePaths)))
+		// Update overall progress with file name
+		fileName := filepath.Base(filePath)
+		j.progress.UpdateProgress(i+1, fmt.Sprintf("Processing file %d of %d: %s", i+1, len(filePaths), fileName))
 		if err := j.LoadCSVFile(filePath); err != nil {
 			j.logger.Error("Error loading file %s: %v", filePath, err)
 			// Continue with other files
@@ -541,13 +551,16 @@ func (j *JSONAssetManager) LoadFiles(filePaths []string) error {
 	j.Data["placeholder"] = map[string]string{"ID_BB_GLOBAL": "placeholder"}
 	j.Unlock()
 	
+	// Update progress to show we're saving the final index
+	j.progress.SetStatus("Saving final index after processing all files")
+	
 	// Make sure the index is saved after loading all files
 	if err := j.saveIndex(); err != nil {
 		j.logger.Warn("Error saving index file: %v", err)
 	}
 	
 	// Complete overall progress tracking
-	j.progress.CompleteProgress()
+	j.progress.CompleteProgress("All CSV files processed successfully")
 	
 	// Set system to idle state
 	j.progress.SetStatus("Idle - Ready for queries")

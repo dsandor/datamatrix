@@ -47,8 +47,9 @@ func (pt *ProgressTracker) resetIdleTimer() {
 	}
 	pt.Unlock()
 	
-	// Set a new timer for 5 seconds
-	pt.idleTimer = time.AfterFunc(5*time.Second, func() {
+	// Set a new timer for 30 seconds
+	// Increased from 5 to 30 seconds to prevent premature idle state during processing
+	pt.idleTimer = time.AfterFunc(30*time.Second, func() {
 		// Use a separate function to avoid deadlock
 		pt.setIdleSafe(true)
 	})
@@ -159,13 +160,18 @@ func (pt *ProgressTracker) IncrementProgress(status string) {
 }
 
 // CompleteProgress marks the progress as complete
-func (pt *ProgressTracker) CompleteProgress() {
+func (pt *ProgressTracker) CompleteProgress(completionMessage ...string) {
 	pt.Lock()
 	
 	// Update idle status directly without calling setIdle
 	if pt.isIdle {
 		pt.isIdle = false
 		pt.logger.Info("System is no longer idle (was idle for %s)", time.Since(pt.idleStartTime).Round(time.Second))
+	}
+	
+	// Use the provided completion message if available
+	if len(completionMessage) > 0 && completionMessage[0] != "" {
+		pt.status = completionMessage[0]
 	}
 	
 	if pt.total > 0 {
