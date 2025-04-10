@@ -400,6 +400,47 @@ Response:
 }
 ```
 
+### POST /api/bulk-query
+Retrieve multiple assets by their ID_BB_GLOBAL identifiers with optional column filtering. This endpoint efficiently fetches multiple assets in a single request and can be used to retrieve a specific subset of columns for each asset.
+
+Request body:
+```json
+{
+  "ids": ["BBG000B9XRY4", "BBG000BVPV84"],  // Required: List of ID_BB_GLOBAL identifiers
+  "columns": ["ID_BB_GLOBAL", "Company", "Revenue"]  // Optional: List of columns to return
+}
+```
+
+If the `columns` field is omitted or empty, all columns will be returned for each asset.
+
+Response:
+```json
+{
+  "assets": {
+    "BBG000B9XRY4": {
+      "ID_BB_GLOBAL": "BBG000B9XRY4",
+      "Company": "Apple Inc.",
+      "Revenue": "365.8"
+    },
+    "BBG000BVPV84": {
+      "ID_BB_GLOBAL": "BBG000BVPV84",
+      "Company": "Amazon.com Inc.",
+      "Revenue": "386.1"
+    }
+  },
+  "count": 2,
+  "total": 2,
+  "missing": []  // IDs that were not found
+}
+```
+
+The response includes:
+- `assets`: Map of ID_BB_GLOBAL to asset data
+- `count`: Number of assets successfully retrieved
+- `total`: Total number of IDs requested
+- `missing`: List of IDs that were not found in the database
+- `errors`: (Optional) List of errors encountered during processing
+
 ### GET /api/progress
 Returns the current progress status of file processing, row enumeration, and idle status.
 

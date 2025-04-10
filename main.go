@@ -468,6 +468,16 @@ type QueryResponse struct {
 	Total int64                    `json:"total"` // Total number of records in the database
 }
 
+// BulkQueryRequest defines the structure for the bulk query API request
+type BulkQueryRequest struct {
+	// List of ID_BB_GLOBAL identifiers to retrieve
+	IDs []string `json:"ids" example:"[\"BBG000B9XRY4\",\"BBG000BVPV84\"]"` 
+
+	// Optional list of columns to return. If empty or omitted, all columns will be returned
+	// To select all columns, you can either: 1) omit this field, 2) provide an empty array, or 3) use ["*"]
+	Columns []string `json:"columns,omitempty" example:"[\"ID_BB_GLOBAL\",\"Company\",\"Revenue\"]"` 
+}
+
 // @Summary Query the data_matrix table
 // @Description Execute a SQL query against the data_matrix table with optional filtering and pagination
 // @Description To select all columns (equivalent to SELECT * FROM data_matrix), you can either:
@@ -552,6 +562,101 @@ func (dm *DataMatrix) handleQuery(w http.ResponseWriter, r *http.Request) {
 		Count: len(result),
 		Total: total,
 	})
+}
+
+// @Summary Bulk query assets by ID_BB_GLOBAL
+// @Description Retrieve multiple assets by their ID_BB_GLOBAL identifiers with optional column filtering
+// @Tags query
+// @Accept json
+// @Produce json
+// @Param query body BulkQueryRequest true "Bulk query parameters"
+// @Success 200 {object} map[string]interface{}
+// @Failure 400 {string} string "Invalid request body"
+// @Failure 500 {string} string "Query error"
+// @Router /api/bulk-query [post]
+func (dm *DataMatrix) handleBulkQuery(w http.ResponseWriter, r *http.Request) {
+	var params BulkQueryRequest
+
+	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Validate that IDs are provided
+	if len(params.IDs) == 0 {
+		http.Error(w, "No IDs provided in request", http.StatusBadRequest)
+		return
+	}
+
+	dm.RLock()
+	defer dm.RUnlock()
+
+	// Process assets in parallel using goroutines for better performance
+	type assetResult struct {
+		id    string
+		asset map[string]string
+		err   error
+	}
+
+	// Create a channel to collect results
+	resultChan := make(chan assetResult, len(params.IDs))
+
+	// Process each ID in a separate goroutine
+	for _, id := range params.IDs {
+		go func(assetID string) {
+			var asset map[string]string
+			var err error
+
+			// If columns are specified, use GetAssetWithColumns
+			if len(params.Columns) > 0 {
+				asset, err = dm.assetManager.GetAssetWithColumns(assetID, params.Columns)
+			} else {
+				// Otherwise, get the full asset
+				asset, err = dm.assetManager.GetAsset(assetID)
+			}
+
+			resultChan <- assetResult{id: assetID, asset: asset, err: err}
+		}(id)
+	}
+
+	// Collect results
+	assets := make(map[string]map[string]string)
+	missing := make([]string, 0)
+	errors := make([]string, 0)
+
+	for i := 0; i < len(params.IDs); i++ {
+		result := <-resultChan
+
+		if result.err != nil {
+			// Check if the error is because the asset doesn't exist
+			if os.IsNotExist(result.err) || strings.Contains(result.err.Error(), "asset not found") {
+				missing = append(missing, result.id)
+			} else {
+				// Other errors
+				errors = append(errors, fmt.Sprintf("%s: %v", result.id, result.err))
+			}
+		} else {
+			// Add the asset to the results
+			assets[result.id] = result.asset
+		}
+	}
+
+	// Prepare response
+	response := map[string]interface{}{
+		"assets":  assets,
+		"count":   len(assets),
+		"total":   len(params.IDs),
+		"missing": missing,
+	}
+
+	// Include errors if any
+	if len(errors) > 0 {
+		response["errors"] = errors
+	}
+
+	// Return the results as JSON
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // @title DataMatrix API
@@ -744,6 +849,7 @@ func main() {
 	r.HandleFunc("/api/columns", dm.handleGetColumns).Methods("GET")
 	r.HandleFunc("/api/index", dm.handleGetIndexInfo).Methods("GET")
 	r.HandleFunc("/api/query", dm.handleQuery).Methods("POST")
+	r.HandleFunc("/api/bulk-query", dm.handleBulkQuery).Methods("POST")
 	r.HandleFunc("/api/progress", dm.handleGetProgress).Methods("GET")
 	r.HandleFunc("/api/asset/{id}", dm.handleGetAsset).Methods("GET")
 	r.HandleFunc("/api/asset/{id}/columns", dm.handleGetAssetColumns).Methods("GET")
