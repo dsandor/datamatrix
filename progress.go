@@ -203,6 +203,31 @@ func (pt *ProgressTracker) SetStatus(status string) {
 	pt.resetIdleTimer()
 }
 
+// UpdateTotal updates the total number of items to process
+func (pt *ProgressTracker) UpdateTotal(total int) {
+	pt.Lock()
+	
+	// Update idle status directly without calling setIdle
+	if pt.isIdle {
+		pt.isIdle = false
+		pt.logger.Info("System is no longer idle (was idle for %s)", time.Since(pt.idleStartTime).Round(time.Second))
+	}
+	
+	pt.total = total
+	
+	// Recalculate percentage if we have a current value
+	if pt.current > 0 && total > 0 {
+		pt.percentage = (pt.current * 100) / total
+		pt.updateProgressBar()
+	}
+	
+	pt.logger.Info("%s: Updated total to %d", pt.status, total)
+	pt.Unlock()
+	
+	// Reset the idle timer after releasing the lock
+	pt.resetIdleTimer()
+}
+
 // updateProgressBar updates the progress bar string
 func (pt *ProgressTracker) updateProgressBar() {
 	width := 30 // Width of the progress bar

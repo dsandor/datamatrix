@@ -669,11 +669,8 @@ func (j *JSONAssetManager) scanExistingAssets() error {
 	// Start progress tracking
 	j.progress.StartProgress("Scanning existing assets", 0)
 	
-	// Use a map to track unique columns
-	colMap := make(map[string]bool)
-	assetCount := 0
-	
-	// Walk the JSON directory recursively
+	// First, collect all JSON files (non-metadata) to process
+	var jsonFiles []string
 	err := filepath.Walk(j.jsonDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -694,45 +691,103 @@ func (j *JSONAssetManager) scanExistingAssets() error {
 			return nil
 		}
 		
-		// Extract the ID from the filename
-		id := strings.TrimSuffix(filepath.Base(path), ".json")
-		
-		// Add to asset IDs cache
-		j.assetIDsMutex.Lock()
-		j.assetIDs[id] = true
-		j.assetIDsMutex.Unlock()
-		
-		// Load the metadata file
-		metadata, err := j.loadAssetMetadata(id)
-		if err != nil {
-			// If metadata doesn't exist, just skip
-			return nil
-		}
-		
-		// Add columns to the column map
-		for _, col := range metadata.Columns {
-			colMap[col.ColumnName] = true
-		}
-		
-		assetCount++
-		if assetCount % 100 == 0 {
-			j.progress.UpdateProgress(assetCount, fmt.Sprintf("Scanned %d assets", assetCount))
-		}
-		
+		// Add to list of files to process
+		jsonFiles = append(jsonFiles, path)
 		return nil
 	})
 	
+	if err != nil {
+		j.logger.Error("Error walking JSON directory: %v", err)
+		return err
+	}
+	
+	// Update progress with total number of files
+	totalFiles := len(jsonFiles)
+	j.progress.UpdateTotal(totalFiles)
+	j.logger.Info("Found %d JSON files to scan", totalFiles)
+	
+	// Create a channel to distribute work
+	pathChan := make(chan string, totalFiles)
+	
+	// Create a channel for workers to report completion
+	resultChan := make(chan struct{}, totalFiles)
+	
+	// Create a mutex-protected map for columns
+	colMapMutex := &sync.Mutex{}
+	colMap := make(map[string]bool)
+	
+	// Determine number of workers (use number of CPUs)
+	numWorkers := runtime.NumCPU()
+	j.logger.Info("Starting %d workers for parallel asset scanning", numWorkers)
+	
+	// Start worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		go func(workerID int) {
+			for path := range pathChan {
+				// Extract the ID from the filename
+				id := strings.TrimSuffix(filepath.Base(path), ".json")
+				
+				// Add to asset IDs cache
+				j.assetIDsMutex.Lock()
+				j.assetIDs[id] = true
+				j.assetIDsMutex.Unlock()
+				
+				// Load the metadata file
+				metadata, err := j.loadAssetMetadata(id)
+				if err == nil {
+					// Add columns to the column map
+					colMapMutex.Lock()
+					for _, col := range metadata.Columns {
+						colMap[col.ColumnName] = true
+					}
+					colMapMutex.Unlock()
+				}
+				
+				// Report completion
+				resultChan <- struct{}{}
+			}
+		}(i)
+	}
+	
+	// Send all paths to the channel
+	for _, path := range jsonFiles {
+		pathChan <- path
+	}
+	close(pathChan)
+	
+	// Track progress
+	processedCount := 0
+	for range resultChan {
+		processedCount++
+		
+		// Update progress every 100 files
+		if processedCount % 100 == 0 || processedCount == totalFiles {
+			j.progress.UpdateProgress(processedCount, fmt.Sprintf("Scanned %d/%d assets", processedCount, totalFiles))
+		}
+		
+		// Exit when all files are processed
+		if processedCount >= totalFiles {
+			break
+		}
+	}
+	
 	// Convert the column map to a slice
 	j.columnsMutex.Lock()
+	j.columns = make([]string, 0, len(colMap))
 	for col := range colMap {
 		j.columns = append(j.columns, col)
 	}
 	j.columnsMutex.Unlock()
 	
+	// Get final asset count
+	j.assetIDsMutex.RLock()
+	assetCount := len(j.assetIDs)
+	j.assetIDsMutex.RUnlock()
+	
 	j.progress.CompleteProgress(fmt.Sprintf("Scanned %d assets with %d unique columns", assetCount, len(colMap)))
 	j.logger.Info("Scanned %d assets with %d unique columns", assetCount, len(colMap))
 	
-	return err
+	return nil
 }
 
 // getAssetMetadataPath returns the path to the metadata file for an asset

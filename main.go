@@ -27,7 +27,8 @@ type DataMatrix struct {
 	dataDir        string   // Local directory for downloaded S3 files
 	dirWhitelist   []string // Optional whitelist of directory names
 	idPrefixFilter []string // Optional ID_BB_GLOBAL prefix filter
-	skipFileLoading bool    // Flag to skip file loading and downloading
+	skipFileLoading bool    // Flag to skip file loading
+	skipDownloading bool    // Flag to skip downloading from S3
 }
 
 // DataMatrixConfig holds configuration for DataMatrix initialization
@@ -37,7 +38,8 @@ type DataMatrixConfig struct {
 	DataDir        string   `json:"data_dir,omitempty"`        // Directory for downloaded S3 files (default: "data")
 	DirWhitelist   []string `json:"dir_whitelist,omitempty"`   // Optional whitelist of directory names
 	IDPrefixFilter []string `json:"id_prefix_filter,omitempty"` // Optional ID_BB_GLOBAL prefix filter
-	SkipFileLoading bool     `json:"skip_file_loading,omitempty"` // Flag to skip file loading and downloading
+	SkipFileLoading bool     `json:"skip_file_loading,omitempty"` // Flag to skip file loading
+	SkipDownloading bool     `json:"skip_downloading,omitempty"` // Flag to skip downloading from S3
 	ConfigFile     string   `json:"-"`                         // Path to the configuration file (not stored in JSON)
 }
 
@@ -80,17 +82,20 @@ func NewDataMatrix(config *DataMatrixConfig) (*DataMatrix, error) {
 		dirWhitelist:   config.DirWhitelist,
 		idPrefixFilter: config.IDPrefixFilter,
 		skipFileLoading: config.SkipFileLoading,
+		skipDownloading: config.SkipDownloading,
 	}
 
-	// Only load data if not skipping file loading
-	if !dm.skipFileLoading {
+	// Handle data loading based on flags
+	if dm.skipFileLoading && dm.skipDownloading {
+		// When both flags are set, completely skip loading and scanning
+		logger.Info("Skipping both file loading and downloading as requested")
+		logger.Info("Will serve API using existing data from disk without scanning")
+	} else {
+		// Otherwise, call loadData which will handle the flags appropriately
 		if err := dm.loadData(); err != nil {
 			logger.Error("Error loading data: %v", err)
 			return nil, err
 		}
-	} else {
-		logger.Info("Skipping file loading and downloading as requested")
-		logger.Info("Will serve API using existing data from disk")
 	}
 
 	// Log memory usage after loading data
@@ -173,8 +178,16 @@ func (dm *DataMatrix) loadData() error {
 		dm.logger.Success("Found %d CSV files in example-data directory and subdirectories (up to 2 levels deep)", len(csvFiles))
 	}
 
-	// If we're skipping file loading, just scan existing assets
+	// If we're skipping file loading
 	if dm.skipFileLoading {
+		// If we're also skipping downloading, completely skip asset scanning
+		if dm.skipDownloading {
+			dm.logger.Info("Skipping both file loading and downloading, starting API server with existing data...")
+			dm.logger.Success("API server ready to serve existing data from disk")
+			return nil
+		}
+		
+		// Otherwise, just scan existing assets
 		dm.logger.Info("Skipping file loading, scanning existing assets on disk...")
 		
 		// Ensure the asset manager scans existing assets
@@ -633,6 +646,11 @@ func main() {
 			logger.Error("Error loading configuration from file: %v", err)
 			os.Exit(1)
 		}
+		
+		// Apply command line flags to config
+		config.SkipFileLoading = *skipFileLoading
+		config.SkipDownloading = *skipDownloading
+		
 		logger.Success("Configuration loaded from file: %s", configFile)
 	} else {
 		// Check if default config file exists
@@ -645,6 +663,11 @@ func main() {
 				logger.Error("Error loading configuration from default file: %v", err)
 				os.Exit(1)
 			}
+			
+			// Apply command line flags to config
+			config.SkipFileLoading = *skipFileLoading
+			config.SkipDownloading = *skipDownloading
+			
 			logger.Success("Configuration loaded from default file: %s", defaultConfigFile)
 		} else {
 			// No config file, use environment variables
@@ -653,6 +676,7 @@ func main() {
 			
 			// Apply command line flags to config
 			config.SkipFileLoading = *skipFileLoading
+			config.SkipDownloading = *skipDownloading
 			
 			// Handle skip-downloading flag - if we're skipping downloading but not skipping loading,
 			// we'll still process local files
